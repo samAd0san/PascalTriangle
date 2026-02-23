@@ -1,0 +1,2036 @@
+agent.py 
+
+ 
+
+""" agent.py -- Multi-tenant LiveKit voice agent. 
+
+Per-call flow: 1. Room arrives -> extract phone from room name OR outbound metadata 2. asyncpg pool query -> phone -> tenant -> location + agent + menu (~5ms, once) 3. Build SYSTEM_PROMPT dynamically for THIS restaurant 4. Function tools are closures over per-call order_tracker + menu_data -> zero I/O on the hot path, all in-process 5. Single pipeline: nova-2 STT + Azure OpenAI + eleven_flash_v2_5 TTS 6. On finalize: DB write + SMS happen in asyncio.gather (non-blocking) """ 
+
+importos importjson importasyncio importlogging fromdatetimeimportdatetime fromdotenvimportload_dotenv fromlivekitimportagents, rtc, apiaslk_api fromlivekit.agentsimport ( JobContext, WorkerOptions, cli, function_tool, RunContext, ) fromlivekit.pluginsimportdeepgram, openai, silero, elevenlabs fromhelpers.dbimportget_restaurant_config, save_call_log, close_pool fromhelpers.order_trackerimportOrderEventTracker 
+
+try: fromlivekit.pluginsimportnoise_cancellation 
+
+HAS_NC=True exceptImportError: HAS_NC=False 
+
+load_dotenv() 
+
+logger=logging.getLogger("ivr.agent") 
+
+BASE_DIR=os.path.dirname(os.path.dirname(os.path.abspath(__file__))) ALGO_PATH=os.path.join(BASE_DIR, "instructions", "algo.md") 
+
+withopen(ALGO_PATH) asf: IVR_ALGO_TEMPLATE=f.read() 
+
+ 
+
+# -- Pure helpers (no I/O) ---------------------------------------------------- 
+
+ 
+
+defextract_phone_from_room(room_name: str) -> str|None: """parcera-15551234567-abc123 -> +15551234567""" parts=room_name.split("-") iflen(parts) >=2andparts[0] =="parcera"andparts[1].isdigit(): returnf"+{parts[1]}" returnNone 
+
+ 
+
+defbuild_menu_text(menu_data: dict) -> str: """Format menu data as plaintext for the system prompt.""" ifnotmenu_data: return"\nMENU: Contact staff for current menu.\n" name= ( menu_data.get("business_context", {}).get("name", "Restaurant").upper() ) text=f"\n=== {name} MENU ===\n" forcatinmenu_data.get("catalog", {}).get("categories", []): available= [ iforiincat.get("items", []) ifi.get("available", True) ] ifavailable: text+=f"\n{cat['name']}:\n" foriteminavailable: text+=f"\n - {item['name']}: ${item['price']}\n" ifitem.get("sizes"): text+=f" Sizes: {', '.join(s['name'] forsinitem['sizes'])}\n" ifitem.get("modifiers"): text+=f" Modifiers: {', '.join(m['name'] forminitem['modifiers'])}\n" returntext 
+
+ 
+
+deffind_menu_item(name: str, menu_data: dict) -> dict|None: """Look up a menu item by name (case-insensitive).""" lower=name.lower() forcatinmenu_data.get("catalog", {}).get("categories", []): foritemincat.get("items", []): ifitem["name"].lower() ==lower: returnitem returnNone 
+
+ 
+
+defbuild_system_prompt(config: dict, algo_template: str) -> str: """Build a dynamic system prompt from DB config + algo template.""" restaurant_name=config["restaurant_name"] algo=algo_template.replace("{restaurant_name}", restaurant_name) menu=build_menu_text(config.get("menu_data") or {}) override=config.get("system_prompt_override") or"" address=config.get("address") or"Address not available" hours=config.get("operating_hours") or {} hours_text= ( json.dumps(hours, indent=2) ifisinstance(hours, dict) elsestr(hours) ) 
+
+# Extract delivery/order policies from reservation_provider_config provider_config=config.get("reservation_provider_config") or {} delivery_fee=provider_config.get("delivery_fee", 3.99) min_delivery=provider_config.get("min_delivery_order", 15) delivery_radius=provider_config.get("delivery_radius_miles", 5) 
+
+returnf"""{override} 
+
+TODAY'S DATE: {datetime.now().strftime('%B %d, %Y')} ({datetime.now().strftime('%Y-%m-%d')}) Resolve all relative dates ("tomorrow", "next Friday") from this date. 
+
+MENU RULE: ONLY recommend items listed in the menu below. Do not mention items not in the list. If unavailable, suggest alternatives. 
+
+{algo} 
+
+{menu} 
+
+RESTAURANT: - Name: {restaurant_name} - Address: {address} 
+
+OPERATING HOURS: {hours_text} 
+
+POLICIES: - Min delivery order: ${min_delivery} - Delivery fee: ${delivery_fee} - Delivery radius: {delivery_radius} miles """.strip() 
+
+ 
+
+# ============================================================================== # ENTRYPOINT # ============================================================================== 
+
+ 
+
+asyncdefentrypoint(ctx: JobContext): awaitctx.connect() logger.info(f"Room: {ctx.room.name}") 
+
+# -- 1. Resolve phone number ----------------------------------------------- phone_number=None is_outbound=False 
+
+ifctx.job.metadata: try: meta=json.loads(ctx.job.metadata) phone_number=meta.get("phone_number") is_outbound=bool(phone_number) except (json.JSONDecodeError, TypeError): pass 
+
+ifnotphone_number: phone_number=extract_phone_from_room(ctx.room.name) 
+
+ifnotphone_number: logger.error("Cannot resolve phone -- shutting down") awaitctx.shutdown() return 
+
+# -- 2. Load restaurant config from identity-db (ONCE per call) ------------ logger.info(f"Resolving config for {phone_number}...") config=awaitget_restaurant_config(phone_number) ifnotconfig: logger.error( f"No restaurant found for {phone_number} in identity-db" ) awaitctx.shutdown() return 
+
+logger.info( f"{config['restaurant_name']} | tenant: {config['tenant_slug']} " f"| agent: {config['agent_id']}" ) 
+
+# -- 3. Outbound PSTN: dial via SIP trunk ---------------------------------- ifis_outbound: sip_trunk_id=config.get("sip_trunk_id") ifnotsip_trunk_id: logger.error(f"No sip_trunk_id for {phone_number}") awaitctx.shutdown() return try: awaitctx.api.sip.create_sip_participant( lk_api.CreateSIPParticipantRequest( room_name=ctx.room.name, sip_trunk_id=sip_trunk_id, sip_call_to=phone_number, participant_identity=phone_number, wait_until_answered=True, ) ) logger.info(f"Outbound answered: {phone_number}") exceptlk_api.TwirpErrorase: logger.error(f"Outbound failed: {e.message}") awaitctx.shutdown() return 
+
+# -- 4. Wait for participant ----------------------------------------------- participant=awaitctx.wait_for_participant() is_pstn= ( participant.kind==rtc.ParticipantKind.PARTICIPANT_KIND_SIP ) caller_number=participant.attributes.get( "sip.phoneNumber", participant.identity ) call_started=datetime.utcnow() logger.info( f"{'PSTN'ifis_pstnelse'VoIP'} | caller: {caller_number}" ) 
+
+# -- 5. Per-call state ----------------------------------------------------- provider_config=config.get("reservation_provider_config") or {} order_tracker=OrderEventTracker( restaurant_id=config["location_id"], schema_name=config["schema_name"], delivery_fee=provider_config.get("delivery_fee", 3.99), tax_rate=provider_config.get("tax_rate", 0.08), ) order_tracker.session_created() 
+
+menu_data=config.get("menu_data") or {} system_prompt=build_system_prompt(config, IVR_ALGO_TEMPLATE) 
+
+# -- 6. Function tools (closures -- zero import overhead) ------------------ 
+
+@function_tool() asyncdefrecord_order_type( context: RunContext, order_type: str ) -> str: """Record delivery or pickup. order_type: 'delivery' or 'pickup'""" order_tracker.order_type_selected(order_type) returnf"OK {order_type}" 
+
+@function_tool() asyncdefrecord_delivery_address( context: RunContext, address_text: str ) -> str: """Record delivery address. address_text: full street address""" order_tracker.order_address_set(address_text) return"OK Address recorded" 
+
+@function_tool() asyncdefadd_item_to_cart( context: RunContext, item_name: str, quantity: int=1, modifiers: list[str] =None, ) -> str: """Add menu item to cart. item_name: exact name from menu""" item=find_menu_item(item_name, menu_data) ifnotitem: returnf"NOT_FOUND '{item_name}' not found in menu." ifnotitem.get("available", True): returnf"UNAVAILABLE '{item_name}' is currently unavailable." order_tracker.order_item_added( item_name, quantity, modifiersor [] ) return ( f"OK Added {quantity}x {item_name}. " f"Cart: {len(order_tracker.cart_items)} items." ) 
+
+@function_tool() asyncdefupdate_cart_item( context: RunContext, item_index: int, quantity: int=None, modifiers: list[str] =None, special_instructions: str=None, ) -> str: """Update cart item. item_index: 0-based""" ifitem_index>=len(order_tracker.cart_items): returnf"ERROR No item at index {item_index}." order_tracker.order_item_updated( item_index, quantity, modifiers, special_instructions ) returnf"OK Updated item #{item_index}" 
+
+@function_tool() asyncdefremove_cart_item( context: RunContext, item_index: int ) -> str: """Remove item from cart. item_index: 0-based""" ifitem_index>=len(order_tracker.cart_items): returnf"ERROR No item at index {item_index}." name=order_tracker.cart_items[item_index]["item_name"] order_tracker.order_item_removed(item_index) returnf"OK Removed {name}." 
+
+@function_tool() asyncdefcalculate_order_total(context: RunContext) -> str: """Calculate order total with tax and delivery fee.""" t=order_tracker.calculate_total(menu_data) return ( f"OK Total: ${t['total']:.2f} " f"(subtotal: ${t['subtotal']:.2f}, tax: ${t['tax']:.2f})" ) 
+
+@function_tool() asyncdefrecord_payment_info( context: RunContext, payment_method: str, card_number: str=None, cvv: str=None, expiry: str=None, zipcode: str=None, ) -> str: """Record payment. payment_method: 'card' or 'cash'.""" ifpayment_method=="card": ifnotall([card_number, cvv, expiry, zipcode]): return"ERROR Card requires card_number, cvv, expiry, zipcode." returnawaitorder_tracker.order_payment_set( payment_method="card", card_no=card_number, cvv=cvv, card_expiry=expiry, billing_zipcode=zipcode, menu_data=menu_data, ) elifpayment_method=="cash": awaitorder_tracker.order_payment_set( payment_method="cash", menu_data=menu_data ) t=order_tracker.calculate_total(menu_data) returnf"OK Cash: ${t['total']:.2f}" return"ERROR Invalid payment method." 
+
+@function_tool() asyncdefrecord_customer_info( context: RunContext, customer_name: str, customer_phone: str ) -> str: """Record customer name and phone.""" order_tracker.order_customer_info_set(customer_name, customer_phone) returnf"OK Recorded for {customer_name}" 
+
+@function_tool() asyncdeffinalize_order(context: RunContext) -> str: """Finalize and submit the order. Saves to DB, sends SMS.""" awaitorder_tracker.order_finalized_async(config) return ( f"OK Order #{order_tracker.order_number[-4:]} confirmed! " f"SMS sent." ) 
+
+@function_tool() asyncdefcancel_order( context: RunContext, reason: str="Customer requested" ) -> str: """Cancel the current order.""" order_tracker.session_cancelled(reason) return"OK Order cancelled." 
+
+@function_tool() asyncdefrecord_reservation_date( context: RunContext, date: str ) -> str: """Record reservation date. date: YYYY-MM-DD""" order_tracker.reservation_date_set(date) returnf"OK Date: {date}" 
+
+@function_tool() asyncdefrecord_reservation_guests( context: RunContext, guests: int ) -> str: """Record guest count. guests: 1-8""" max_party=config.get("max_party_size") or8 min_party=config.get("min_party_size") or1 ifnotmin_party<=guests<=max_party: return ( f"ERROR We accommodate {min_party}-{max_party} guests " f"per reservation." ) order_tracker.reservation_guests_set(guests) returnf"OK {guests} guests" 
+
+@function_tool() asyncdefcheck_available_times( context: RunContext, preferred_time: str ) -> str: """Return 3 available time slots near preferred time. preferred_time: HH:MM 24h""" # TODO: Integrate with actual reservation provider API (Toast Tables / Parcera Tables) # Currently returns random slots for MVP. Replace with call to: # config['reservation_provider'] API using config['reservation_provider_config'] importrandom fromdatetimeimporttimedelta 
+
+try: h, m=map(int, preferred_time.split(":")) base=datetime.now().replace( hour=h, minute=m, second=0, microsecond=0 ) offsets=sorted( random.sample([-45, -30, -15, 15, 30, 45, 60], 3) ) slots= [ (base+timedelta(minutes=o)).strftime("%H:%M") foroinoffsets if9<= (base+timedelta(minutes=o)).hour<21 ] returnjson.dumps(slots[:3] or ["17:00", "17:30", "18:00"]) exceptException: returnjson.dumps(["17:00", "17:30", "18:00"]) 
+
+@function_tool() asyncdefrecord_reservation_time( context: RunContext, time: str ) -> str: """Record reservation time. time: HH:MM 24h""" order_tracker.reservation_time_set(time) returnf"OK Time: {time}" 
+
+@function_tool() asyncdefrecord_reservation_contact( context: RunContext, name: str, phone: str, email: str="", special_requests: str="", ) -> str: """Record reservation contact. phone: 10 digits""" digits="".join(filter(str.isdigit, phone)) iflen(digits) !=10: returnf"ERROR Need 10-digit phone, got {len(digits)} digits." order_tracker.reservation_contact_set( name, digits, email, special_requests ) returnf"OK Contact for {name}" 
+
+@function_tool() asyncdeffinalize_reservation(context: RunContext) -> str: """Confirm the reservation. Saves to DB, sends SMS.""" res_id=awaitorder_tracker.reservation_finalized_async(config) returnf"OK Reservation confirmed! ID: {res_id}" 
+
+tools= [ record_order_type, record_delivery_address, add_item_to_cart, update_cart_item, remove_cart_item, calculate_order_total, record_payment_info, record_customer_info, finalize_order, cancel_order, record_reservation_date, record_reservation_guests, check_available_times, record_reservation_time, record_reservation_contact, finalize_reservation, ] 
+
+# -- 7. Session pipeline --------------------------------------------------- session=agents.AgentSession( stt=deepgram.STT( model="nova-2", api_key=os.getenv("DEEPGRAM_API_KEY"), interim_results=True, ), llm=openai.LLM.with_azure( azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"), azure_deployment=os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME"), api_version=os.getenv("AZURE_OPENAI_API_VERSION"), api_key=os.getenv("AZURE_OPENAI_API_KEY"), temperature=config.get("temperature", 0.5), ), tts=elevenlabs.TTS( voice_id=config.get("voice_id", "cgSgspJ2msm6clMCkdW9"), model="eleven_flash_v2_5", api_key=os.getenv("ELEVENLABS_API_KEY"), voice_settings=elevenlabs.VoiceSettings( stability=0.65, similarity_boost=0.75, style=0.0, use_speaker_boost=True, ), streaming_latency=1, chunk_length_schedule=[50, 90, 120, 150], ), vad=silero.VAD.load( min_speech_duration=0.05, min_silence_duration=0.35, padding_duration=0.15, activation_threshold=0.4, ), preemptive_generation=True, ) 
+
+# -- 8. Session end: write call log (non-blocking) ------------------------- @session.on("session_end") defon_session_end(): call_ended=datetime.utcnow() duration=int((call_ended-call_started).total_seconds()) mode="PSTN"ifis_pstnelse"VoIP" logger.info( f"{mode} | {config['restaurant_name']} | {duration}s | " f"{len(order_tracker.cart_items)} items" ) 
+
+asyncdef_write_call_log(): awaitsave_call_log( config["schema_name"], { "location_id": config["location_id"], "agent_id": config["agent_id"], "session_id": order_tracker.session_id, "call_type": "outbound"ifis_outboundelse"inbound", "source": "pstn"ifis_pstnelse"webrtc", "duration_seconds": duration, "status": "completed", "sip_call_id": ctx.room.name, "started_at": call_started, "ended_at": call_ended, }, ) 
+
+asyncio.create_task(_write_call_log()) 
+
+# -- 9. Start session ------------------------------------------------------ room_opts= {} ifHAS_NC: room_opts["noise_cancellation"] =noise_cancellation.BVC() 
+
+awaitsession.start( room=ctx.room, agent=agents.Agent(instructions=system_prompt, tools=tools), room_input_options=( agents.RoomInputOptions(**room_opts) ifroom_optselseNone ), ) 
+
+# -- 10. First message ----------------------------------------------------- # For PSTN calls, give the SIP participant's audio track time to subscribe # (prevents first message from being cut off on phone calls) ifis_pstn: awaitasyncio.sleep(0.5) first_msg=config.get("first_message") or ( f"Thank you for calling {config['restaurant_name']}! " f"How can I help you today?" ) awaitsession.say(first_msg, allow_interruptions=True) 
+
+ 
+
+if__name__=="__main__": cli.run_app( WorkerOptions( entrypoint_fnc=entrypoint, agent_name="parcera-ivr-agent", api_key=os.getenv("LIVEKIT_API_KEY"), api_secret=os.getenv("LIVEKIT_API_SECRET"), ws_url=os.getenv("LIVEKIT_URL"), ) ) 
+
+ 
+
+ 
+
+server.py 
+
+ 
+
+ 
+
+""" server.py — Thin FastAPI service for the IVR agent. 
+
+Endpoints: GET /health — container health check POST /token — generate LiveKit room token for WebRTC calls POST /outbound-call — trigger outbound PSTN call via LiveKit SIP POST /onboard-phone — provision LiveKit + Twilio SIP (idempotent) POST /cleanup-phone — teardown LiveKit + Twilio SIP for a number 
+
+All order/reservation/menu CRUD is handled through conversation-engine and identity-service APIs. This server only does what the LiveKit telephony layer needs. """ 
+
+importos importjson importuuid importsecrets importstring importlogging importasyncio importuvicorn fromdotenvimportload_dotenv fromfastapiimportFastAPI, HTTPException fromfastapi.middleware.corsimportCORSMiddleware frompydanticimportBaseModel fromlivekitimportapi fromtwilio.restimportClientasTwilioClient fromtwilio.base.exceptionsimportTwilioRestException 
+
+load_dotenv() 
+
+logger=logging.getLogger("ivr.server") 
+
+app=FastAPI(title="Parcera IVR Server") 
+
+app.add_middleware( CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"], ) 
+
+# -- Config ------------------------------------------------------------------- 
+
+LIVEKIT_URL=os.getenv("LIVEKIT_URL", "") LIVEKIT_API_KEY=os.getenv("LIVEKIT_API_KEY", "") LIVEKIT_API_SECRET=os.getenv("LIVEKIT_API_SECRET", "") LIVEKIT_SIP_URI=os.getenv("LIVEKIT_SIP_URI", "") # e.g. 3kxm9r7v.sip.livekit.cloud TWILIO_ACCOUNT_SID=os.getenv("TWILIO_ACCOUNT_SID", "") TWILIO_AUTH_TOKEN=os.getenv("TWILIO_AUTH_TOKEN", "") 
+
+AGENT_NAME=os.getenv("IVR_AGENT_NAME", "parcera-ivr-agent") # MUST match agent.py 
+
+# Test mode: skip Twilio purchase, use fixed number TEST_MODE=os.getenv("TWILIO_TEST_MODE", "false").lower() =="true" TEST_PHONE=os.getenv("TWILIO_TEST_PHONE_NUMBER", "") 
+
+ 
+
+# -- Models ------------------------------------------------------------------- 
+
+ 
+
+classTokenRequest(BaseModel): room_name: str|None=None participant_name: str="web-user" phone_number: str|None=None 
+
+ 
+
+classOutboundCallRequest(BaseModel): phone_number: str room_name: str|None=None 
+
+ 
+
+classPhoneOnboardRequest(BaseModel): phone_number: str location_id: str|None=None# UUID — used for DB persistence context schema_name: str|None=None# tenant schema, e.g. "tenant_simply_south" 
+
+ 
+
+classPhoneCleanupRequest(BaseModel): phone_number: str schema_name: str|None=None 
+
+ 
+
+# -- Helpers ------------------------------------------------------------------ 
+
+ 
+
+def_generate_sip_password(length: int=28) -> str: alphabet=string.ascii_letters+string.digits return"".join(secrets.choice(alphabet) for_inrange(length)) 
+
+ 
+
+def_normalize_sip_uri(raw: str) -> str: """Strip sip: or sip:// prefix so we get a bare hostname.""" returnraw.replace("sip://", "").replace("sip:", "").strip() 
+
+ 
+
+# -- Endpoints ---------------------------------------------------------------- 
+
+ 
+
+@app.get("/health") asyncdefhealth(): return { "status": "ok", "service": "ivr-server", "agent_name": AGENT_NAME, "test_mode": TEST_MODE, "livekit_configured": bool(LIVEKIT_URLandLIVEKIT_API_KEY), } 
+
+ 
+
+@app.post("/token") asyncdefcreate_token(req: TokenRequest): """ Generate a LiveKit room token for WebRTC-based calls. Used by merchant-console TelephonyVoicePage to test the voice agent. """ ifnotLIVEKIT_API_KEYornotLIVEKIT_API_SECRET: raiseHTTPException(500, "LiveKit credentials not configured") 
+
+phone= (req.phone_numberor"").replace("+", "") room_name=req.room_nameorf"parcera-{phone}-{uuid.uuid4().hex[:8]}" 
+
+token=api.AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET) token.with_identity(req.participant_name) token.with_name(req.participant_name) token.with_grants( api.VideoGrants(room_join=True, room=room_name) ) 
+
+return { "token": token.to_jwt(), "url": LIVEKIT_URL, "room_name": room_name, } 
+
+ 
+
+@app.post("/outbound-call") asyncdefoutbound_call(req: OutboundCallRequest): """ Trigger an outbound PSTN call. 
+
+Creates a LiveKit room and dispatches the ivr-agent with metadata containing the phone number. The agent's entrypoint reads this metadata, resolves the restaurant config, and dials via SIP trunk. """ ifnotLIVEKIT_API_KEYornotLIVEKIT_API_SECRETornotLIVEKIT_URL: raiseHTTPException(500, "LiveKit credentials not configured") 
+
+phone=req.phone_number ifnotphone.startswith("+"): phone=f"+{phone}" 
+
+room_name= ( req.room_name orf"parcera-{phone.replace('+', '')}-{uuid.uuid4().hex[:8]}" ) 
+
+try: lk=api.LiveKitAPI(LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET) awaitlk.room.create_room( api.CreateRoomRequest(name=room_name, empty_timeout=30) ) 
+
+awaitlk.room.update_room_metadata( api.UpdateRoomMetadataRequest( room=room_name, metadata=json.dumps({"phone_number": phone}), ) ) awaitlk.aclose() 
+
+logger.info(f"Outbound room created: {room_name} -> {phone}") return { "status": "room_created", "room_name": room_name, "phone_number": phone, } exceptExceptionase: logger.error(f"Outbound call failed: {e}") raiseHTTPException(500, f"Failed to create outbound call: {e}") 
+
+ 
+
+@app.post("/onboard-phone") asyncdefonboard_phone(req: PhoneOnboardRequest): """ Provision LiveKit SIP trunks + Twilio SIP trunk for a phone number. Idempotent — checks DB for existing SIP config before creating. In TWILIO_TEST_MODE=true: skips Twilio purchase, still creates LiveKit trunks. """ ifnotall([LIVEKIT_API_KEY, LIVEKIT_API_SECRET, LIVEKIT_URL]): raiseHTTPException(500, "LiveKit credentials not configured") ifnotLIVEKIT_SIP_URI: raiseHTTPException(500, "LIVEKIT_SIP_URI not set in .env") 
+
+phone=req.phone_number.strip() ifnotphone.startswith("+"): phone=f"+{phone}" ifnotphone[1:].isdigit() orlen(phone) <10: raiseHTTPException(400, "Invalid E.164 phone number") 
+
+# -- Idempotency: check if already provisioned in DB ------------------- fromhelpers.dbimportget_pool pool=awaitget_pool() 
+
+ifreq.schema_name: try: existing=awaitpool.fetchrow( f'SELECT sip_inbound_trunk_id, sip_outbound_trunk_id ' f'FROM "{req.schema_name}".phone_numbers ' f'WHERE phone_number = $1 AND sip_inbound_trunk_id IS NOT NULL LIMIT 1', phone, ) ifexisting: logger.info(f"Phone {phone} already provisioned — returning existing config") return { "status": "already_provisioned", "phone_number": phone, "inbound_trunk_id": existing["sip_inbound_trunk_id"], "outbound_trunk_id": existing["sip_outbound_trunk_id"], "sip_trunk_id": existing["sip_outbound_trunk_id"], "test_mode": TEST_MODE, } exceptExceptionase: logger.warning(f"Idempotency check failed (non-fatal): {e}") 
+
+phone_digits=phone.lstrip("+") base_name=f"parcera-{phone_digits}" sip_username=f"sip-{phone_digits}" sip_password=_generate_sip_password(28) sip_uri=_normalize_sip_uri(LIVEKIT_SIP_URI) 
+
+lk=api.LiveKitAPI( api_key=LIVEKIT_API_KEY, api_secret=LIVEKIT_API_SECRET, url=LIVEKIT_URL ) 
+
+try: # [1/6] LiveKit inbound trunk inbound_trunk=awaitlk.sip.create_sip_inbound_trunk( api.CreateSIPInboundTrunkRequest( trunk=api.SIPInboundTrunkInfo( name=f"{base_name}-inbound", numbers=[phone], ) ) ) logger.info(f"[1/6] Inbound trunk: {inbound_trunk.sip_trunk_id}") 
+
+# [2/6] LiveKit dispatch rule dispatch_rule=awaitlk.sip.create_sip_dispatch_rule( api.CreateSIPDispatchRuleRequest( name=f"{base_name}-rule", rule=api.SIPDispatchRule( dispatch_rule_individual=api.SIPDispatchRuleIndividual( room_prefix=f"{base_name}-" ) ), room_config=api.RoomConfiguration( agents=[api.RoomAgentDispatch(agent_name=AGENT_NAME)] ), ) ) logger.info(f"[2/6] Dispatch rule: {dispatch_rule.sip_dispatch_rule_id}") 
+
+# -- In test mode: skip Twilio, still create LiveKit trunks -------- ifTEST_MODE: twilio_trunk_sid="TEST_MODE_SKIP" twilio_termination_uri=f"{base_name}.pstn.twilio.com" logger.info(f"TEST_MODE: skipping Twilio trunk creation") else: ifnotall([TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN]): raiseHTTPException(500, "Twilio credentials not configured") 
+
+twilio_client=TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN) 
+
+# [3/6] Twilio SIP trunk twilio_trunk=twilio_client.trunking.v1.trunks.create( friendly_name=f"{base_name}-trunk", domain_name=f"{base_name}.pstn.twilio.com", ) twilio_termination_uri=twilio_trunk.domain_name ifnottwilio_termination_uri: importtime awaitasyncio.to_thread(time.sleep, 2) twilio_termination_uri= ( twilio_client.trunking.v1.trunks(twilio_trunk.sid) .fetch() .domain_name ) ifnottwilio_termination_uri: raiseHTTPException(500, "Could not resolve Twilio termination URI") twilio_trunk_sid=twilio_trunk.sid logger.info(f"[3/6] Twilio trunk: {twilio_trunk_sid} → {twilio_termination_uri}") 
+
+# [4/6] Twilio credential list cred_list=twilio_client.sip.credential_lists.create( friendly_name=f"{base_name}-creds" ) twilio_client.sip.credential_lists(cred_list.sid).credentials.create( username=sip_username, password=sip_password ) twilio_client.trunking.v1.trunks(twilio_trunk_sid).credentials_lists.create( credential_list_sid=cred_list.sid ) logger.info(f"[4/6] Credential list: {cred_list.sid}") 
+
+# [5/6] LiveKit outbound trunk outbound_trunk=awaitlk.sip.create_sip_outbound_trunk( api.CreateSIPOutboundTrunkRequest( trunk=api.SIPOutboundTrunkInfo( name=f"{base_name}-outbound", address=twilio_termination_uri, numbers=[phone], auth_username=sip_username, auth_password=sip_password, transport=api.SIPTransport.SIP_TRANSPORT_TLS, ) ) ) outbound_trunk_id=outbound_trunk.sip_trunk_id logger.info(f"[5/6] Outbound trunk: {outbound_trunk_id}") 
+
+ifnotTEST_MODE: # [6/6] Link Twilio phone -> LiveKit origination twilio_client.trunking.v1.trunks(twilio_trunk_sid).origination_urls.create( weight=1, priority=1, enabled=True, friendly_name=f"{base_name} LiveKit", sip_url=f"sip:{sip_uri}", ) incoming=twilio_client.incoming_phone_numbers.list( phone_number=phone, limit=1 ) ifnotincoming: raiseHTTPException(400, f"Phone number {phone} not found in Twilio account") twilio_client.incoming_phone_numbers(incoming[0].sid).update( trunk_sid=twilio_trunk_sid ) logger.info(f"[6/6] Phone {phone} linked to trunk {twilio_trunk_sid}") 
+
+# -- Persist SIP config to database -------------------------------- fromhelpers.dbimportupdate_phone_sip_config awaitupdate_phone_sip_config( phone_number=phone, inbound_trunk_id=inbound_trunk.sip_trunk_id, dispatch_rule_id=dispatch_rule.sip_dispatch_rule_id, outbound_trunk_id=outbound_trunk_id, twilio_trunk_sid=twilio_trunk_sid, sip_auth_username=sip_username, sip_auth_password=sip_password, schema_name=req.schema_name, ) 
+
+return { "status": "provisioned", "phone_number": phone, "base_name": base_name, "sip_trunk_id": outbound_trunk_id, "dispatch_rule_id": dispatch_rule.sip_dispatch_rule_id, "twilio_trunk_sid": twilio_trunk_sid, "inbound_trunk_id": inbound_trunk.sip_trunk_id, "outbound_trunk_id": outbound_trunk_id, "twilio_termination_uri": twilio_termination_uri, "test_mode": TEST_MODE, } 
+
+exceptTwilioRestExceptionase: logger.error(f"Twilio error during onboarding: {e}") raiseHTTPException(502, f"Twilio error: {e}") exceptHTTPException: raise exceptExceptionase: logger.error(f"Onboarding failed for {phone}: {e}") raiseHTTPException(500, f"Onboarding failed: {e}") finally: awaitlk.aclose() 
+
+ 
+
+@app.post("/cleanup-phone") asyncdefcleanup_phone(req: PhoneCleanupRequest): """ Tear down LiveKit trunks + Twilio SIP trunk for a phone number. Promoted from cleanup_livekit_sip.py CLI to HTTP endpoint. """ ifnotall([LIVEKIT_API_KEY, LIVEKIT_API_SECRET, LIVEKIT_URL]): raiseHTTPException(500, "LiveKit credentials not configured") 
+
+phone=req.phone_number.strip() ifnotphone.startswith("+"): phone=f"+{phone}" 
+
+# Fetch existing SIP IDs from DB fromhelpers.dbimportget_pool, clear_phone_sip_config pool=awaitget_pool() 
+
+row=None schema_name=req.schema_name 
+
+ifschema_name: try: row=awaitpool.fetchrow( f'SELECT sip_inbound_trunk_id, sip_outbound_trunk_id, ' f' sip_dispatch_rule_id, twilio_trunk_sid ' f'FROM "{schema_name}".phone_numbers ' f'WHERE phone_number = $1 LIMIT 1', phone, ) exceptExceptionase: logger.warning(f"DB lookup failed: {e}") 
+
+ifnotrow: # Fallback: try phone_index try: idx=awaitpool.fetchrow( "SELECT schema_name FROM public.phone_index WHERE phone_number = $1", phone, ) ifidx: schema_name=idx["schema_name"] row=awaitpool.fetchrow( f'SELECT sip_inbound_trunk_id, sip_outbound_trunk_id, ' f' sip_dispatch_rule_id, twilio_trunk_sid ' f'FROM "{schema_name}".phone_numbers ' f'WHERE phone_number = $1 LIMIT 1', phone, ) exceptException: pass 
+
+ifnotrow: raiseHTTPException(404, f"Phone {phone} not found in database") 
+
+lk=api.LiveKitAPI( api_key=LIVEKIT_API_KEY, api_secret=LIVEKIT_API_SECRET, url=LIVEKIT_URL ) errors= [] 
+
+try: # Delete LiveKit dispatch rule ifrow["sip_dispatch_rule_id"]: try: awaitlk.sip.delete_sip_dispatch_rule( api.DeleteSIPDispatchRuleRequest( sip_dispatch_rule_id=row["sip_dispatch_rule_id"] ) ) logger.info(f"Deleted dispatch rule: {row['sip_dispatch_rule_id']}") exceptExceptionase: errors.append(f"dispatch_rule: {e}") 
+
+# Delete LiveKit inbound trunk ifrow["sip_inbound_trunk_id"]: try: awaitlk.sip.delete_sip_trunk( api.DeleteSIPTrunkRequest(sip_trunk_id=row["sip_inbound_trunk_id"]) ) logger.info(f"Deleted inbound trunk: {row['sip_inbound_trunk_id']}") exceptExceptionase: errors.append(f"inbound_trunk: {e}") 
+
+# Delete LiveKit outbound trunk ifrow["sip_outbound_trunk_id"]: try: awaitlk.sip.delete_sip_trunk( api.DeleteSIPTrunkRequest(sip_trunk_id=row["sip_outbound_trunk_id"]) ) logger.info(f"Deleted outbound trunk: {row['sip_outbound_trunk_id']}") exceptExceptionase: errors.append(f"outbound_trunk: {e}") 
+
+# Cleanup Twilio trunk (skip in test mode) twilio_sid=row["twilio_trunk_sid"] ifnotTEST_MODEandtwilio_sidandtwilio_sid!="TEST_MODE_SKIP": try: twilio_client=TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN) # Unlink phone number from trunk forpnintwilio_client.trunking.v1.trunks(twilio_sid).phone_numbers.list(): ifpn.phone_number==phone: twilio_client.trunking.v1.trunks(twilio_sid).phone_numbers(pn.sid).delete() # Remove origination URLs fororigintwilio_client.trunking.v1.trunks(twilio_sid).origination_urls.list(): twilio_client.trunking.v1.trunks(twilio_sid).origination_urls(orig.sid).delete() # Detach credential lists forclintwilio_client.trunking.v1.trunks(twilio_sid).credentials_lists.list(): twilio_client.trunking.v1.trunks(twilio_sid).credentials_lists(cl.sid).delete() # Delete the trunk itself twilio_client.trunking.v1.trunks(twilio_sid).delete() # Reset phone number voice config incoming=twilio_client.incoming_phone_numbers.list(phone_number=phone, limit=1) ifincoming: twilio_client.incoming_phone_numbers(incoming[0].sid).update( trunk_sid="", voice_url="", sms_url="" ) logger.info(f"Twilio trunk {twilio_sid} cleaned up") exceptTwilioRestExceptionase: errors.append(f"twilio: {e}") 
+
+# Clear SIP fields from DB ifschema_name: awaitclear_phone_sip_config(schema_name, phone) 
+
+return { "status": "cleaned_up", "phone_number": phone, "errors": errors, } finally: awaitlk.aclose() 
+
+ 
+
+# -- Main -------------------------------------------------------------------- 
+
+if__name__=="__main__": uvicorn.run( "server:app", host="0.0.0.0", port=8000, reload=os.getenv("ENV", "production") !="production", ) 
+
+OnboardingWizards.tsx 
+
+import React, { useState, useCallback, useEffect } from 'react'; import { useNavigate, Link } from 'react-router-dom'; import { clsx } from 'clsx'; import { Check, ChevronRight, ChevronLeft, Store, Mic, Rocket, Loader2, AlertCircle, Sparkles, CheckCircle2, Phone, BookOpen, SkipForward, ArrowLeft, Clock, MapPin, Utensils, Pencil, Info, PartyPopper, Coffee, FileText, Sliders, Eye, EyeOff, ShieldCheck, ArrowRight, Mail, Key, Building2, } from 'lucide-react'; import { Card, CardBody, Button, Badge, Input } from '@/components/ui'; import { GradientBackground } from '@/components/layout/GradientBackground'; import { VoiceGreetingStep } from './VoiceGreetingStep'; import { PhoneLinkingStep } from './PhoneLinkingStep'; import type { PhoneSetupMode, SelectedPhoneInfo } from './PhoneLinkingStep'; import { KnowledgeBaseStep, BusinessKnowledge } from './KnowledgeBaseStep'; import { validatePhoneVerification, validateToastConnect, validateBusinessDetails, validateVoiceCustomization, extractToastGuid, getFirstError, } from './validation'; import { useToastRestaurantInfo } from '@/hooks'; // Using services directly for the launch flow // since we need location-based endpoints import { authService, knowledgeBaseService, merchantService, locationService, locationReservationService, agentService, phoneNumberService } from '@/services'; import { Select } from '@/components/ui'; import { HARDCODED_TENANT_ID } from '@/types'; import { useAuthStore } from '@/store/authStore'; import type { CEMerchant, Agent, Tool, ReservationConfig, BusinessDomain, ReservationProviderType, BulkUpdateEntryItemDto, } from '@/types/conversation-engine'; import type { PhoneNumberResponse } from '@/types'; import toast from 'react-hot-toast'; 
+
+interface OnboardingWizardProps { onComplete?: () => void; } 
+
+type WizardStep = 'verify-phone' | 'toast-connect' | 'business-details' | 'provider-select' | 'customize-voice' | 'phone-linking' | 'knowledge-base' | 'launch'; 
+
+type IvrProvider = 'elevenlabs' | 'parcera_voice'; 
+
+interface StepConfig { id: WizardStep; title: string; description: string; icon: React.ReactNode; isSkippable?: boolean; } 
+
+const STEPS: StepConfig[] = [ { id: 'verify-phone', title: 'Verify Phone', description: 'Confirm your identity', icon: , }, { id: 'toast-connect', title: 'Reservation System', description: 'Connect your restaurant', icon: , }, { id: 'business-details', title: 'Business Details', description: 'Confirm & register your business', icon: , }, { id: 'provider-select', title: 'IVR Provider', description: 'Choose your voice AI engine', icon: , }, { id: 'customize-voice', title: 'Assistant Setup', description: 'Configure your AI assistant', icon: , }, { id: 'phone-linking', title: 'Phone Setup', description: 'Connect phone system', icon: , isSkippable: true, }, { id: 'knowledge-base', title: 'Knowledge Base', description: 'Help your assistant answer questions', icon: , isSkippable: true, }, { id: 'launch', title: 'Launch', description: 'Deploy your AI assistant', icon: , }, ]; 
+
+const STORAGE_KEY = 'merchant-onboarding-wizard'; 
+
+const BUSINESS_TYPE_OPTIONS = [ { value: 'restaurant', label: 'Restaurant' }, { value: 'cafe', label: 'Cafe' }, { value: 'retail', label: 'Retail Store' }, { value: 'salon', label: 'Salon & Spa' }, { value: 'gym', label: 'Gym & Fitness' }, { value: 'clinic', label: 'Clinic & Healthcare' }, { value: 'other', label: 'Other' }, ]; 
+
+// Default FAQs by business domain const DEFAULT_FAQS: Record<string, Array<{ question: string; answer: string }>> = { restaurant: [ { question: 'Do you take walk-ins?', answer: 'Yes, we welcome walk-ins based on availability. For larger parties or peak hours, we recommend making a reservation.', }, { question: 'Can I modify or cancel my reservation?', answer: 'Yes, you can modify or cancel your reservation by calling us. Please try to give us at least 2 hours notice.', }, ], }; 
+
+// Transform business knowledge to KB entries function transformBusinessKnowledgeToEntries(knowledge: BusinessKnowledge): BulkUpdateEntryItemDto[] { const entries: BulkUpdateEntryItemDto[] = []; 
+
+// Payment methods const paymentMethodsSelected: string[] = []; if (knowledge.paymentMethods.visa) paymentMethodsSelected.push('Visa'); if (knowledge.paymentMethods.mastercard) paymentMethodsSelected.push('Mastercard'); if (knowledge.paymentMethods.amex) paymentMethodsSelected.push('American Express'); if (knowledge.paymentMethods.discover) paymentMethodsSelected.push('Discover'); if (knowledge.paymentMethods.cash) paymentMethodsSelected.push('Cash'); if (knowledge.paymentMethods.applePay) paymentMethodsSelected.push('Apple Pay'); if (knowledge.paymentMethods.googlePay) paymentMethodsSelected.push('Google Pay'); if (knowledge.paymentMethodsOther.length > 0) { paymentMethodsSelected.push(...knowledge.paymentMethodsOther); } if (paymentMethodsSelected.length > 0) { entries.push({ category: 'payment_methods', options: paymentMethodsSelected, isEnabled: true }); } 
+
+// Dietary options const dietaryOptionsSelected: string[] = []; if (knowledge.dietaryOptions.vegetarian) dietaryOptionsSelected.push('Vegetarian'); if (knowledge.dietaryOptions.vegan) dietaryOptionsSelected.push('Vegan'); if (knowledge.dietaryOptions.glutenFree) dietaryOptionsSelected.push('Gluten-Free'); if (knowledge.dietaryOptions.halal) dietaryOptionsSelected.push('Halal'); if (knowledge.dietaryOptions.kosher) dietaryOptionsSelected.push('Kosher'); if (knowledge.dietaryOptions.dairyFree) dietaryOptionsSelected.push('Dairy-Free'); if (knowledge.dietaryOptionsOther.length > 0) { dietaryOptionsSelected.push(...knowledge.dietaryOptionsOther); } if (dietaryOptionsSelected.length > 0) { entries.push({ category: 'dietary_options', options: dietaryOptionsSelected, isEnabled: true }); } 
+
+// Allergen info if (knowledge.allergenInfo.trim()) { entries.push({ category: 'allergen_info', content: knowledge.allergenInfo.trim(), isEnabled: true }); } 
+
+// Family features const familyParts: string[] = []; if (knowledge.kidsMenu) familyParts.push('Kids menu available'); if (knowledge.highChairs) familyParts.push('High chairs available'); if (knowledge.familyFriendlyFeatures.trim()) { familyParts.push(knowledge.familyFriendlyFeatures.trim()); } if (familyParts.length > 0) { entries.push({ category: 'family_friendly_features', content: familyParts.join('. '), isEnabled: true }); } 
+
+// Parking if (knowledge.parkingDetails.trim()) { entries.push({ category: 'parking_info', content: knowledge.parkingDetails.trim(), isEnabled: true }); } 
+
+// FAQs if (knowledge.faqs.length > 0) { const validFaqs = knowledge.faqs.filter((faq) => faq.question.trim() && faq.answer.trim()); if (validFaqs.length > 0) { const formattedFaqs = validFaqs.map((faq) => Q: ${faq.question.trim()}\nA: ${faq.answer.trim()}).join('\n\n'); entries.push({ category: 'faq', content: formattedFaqs, isEnabled: true }); } } 
+
+// About Us if (knowledge.aboutUs.trim()) { entries.push({ category: 'about_us', content: knowledge.aboutUs.trim(), isEnabled: true }); } 
+
+// Other info if (knowledge.otherInfo.trim()) { entries.push({ category: 'other_info', content: knowledge.otherInfo.trim(), isEnabled: true }); } 
+
+return entries; } 
+
+export const OnboardingWizard: React.FC = ({ onComplete }) => { const navigate = useNavigate(); const { login, logout, isAuthenticated } = useAuthStore(); 
+
+// Wizard state const [currentStep, setCurrentStep] = useState('verify-phone'); 
+
+// Phone verification state (Step 0) const [phoneNumber, setPhoneNumber] = useState(''); const [otpSent, setOtpSent] = useState(false); const [otp, setOtp] = useState(''); const [fetchedOtp, setFetchedOtp] = useState(''); const [showOtp, setShowOtp] = useState(false); const [isVerified, setIsVerified] = useState(false); const [phoneLoading, setPhoneLoading] = useState(false); 
+
+// Business details state (Step 1) const [businessForm, setBusinessForm] = useState({ name: '', businessType: 'restaurant', contactEmail: '', contactPhone: '', address: '', activationCode: '', }); const [codeValid, setCodeValid] = useState<boolean | null>(null); const [codeChecking, setCodeChecking] = useState(false); const [businessFormLoading, setBusinessFormLoading] = useState(false); const [businessDetailsComplete, setBusinessDetailsComplete] = useState(false); 
+
+// Data collected during wizard const [merchant, setMerchant] = useState<CEMerchant | null>(null); const [identityMerchantId, setIdentityMerchantId] = useState<string | null>(null); const [locationId, setLocationId] = useState<string | null>(null); const [config, setConfig] = useState<ReservationConfig | null>(null); const [, setTools] = useState<Tool[]>([]); const [agent, setAgent] = useState<Agent | null>(null); 
+
+// IVR provider selection const [ivrProvider, setIvrProvider] = useState('elevenlabs'); 
+
+// Phone provisioning state const [provisionedPhoneNumber, setProvisionedPhoneNumber] = useState<PhoneNumberResponse | null>(null); const [phoneProvisioningError, setPhoneProvisioningError] = useState<string | null>(null); 
+
+// Provider selection (Step 1) const [selectedProvider, setSelectedProvider] = useState('toast_tables'); const [providerConfirmed, setProviderConfirmed] = useState(false); const [toastGuid, setToastGuid] = useState(''); const [toastGuidToFetch, setToastGuidToFetch] = useState(''); const [isCreatingFromToast, setIsCreatingFromToast] = useState(false); 
+
+// Pending Toast data (before merchant created) const [pendingToastData, setPendingToastData] = useState<{ businessName: string; businessDomain: BusinessDomain; phone: string; address: string; restaurantGuid: string; } | null>(null); const [step1DataCollected, setStep1DataCollected] = useState(false); 
+
+// Voice and greeting const [agentName, setAgentName] = useState(''); const [selectedVoiceId, setSelectedVoiceId] = useState(''); const [selectedLanguages, setSelectedLanguages] = useState<string[]>(['en']); const [greetingEn, setGreetingEn] = useState(''); const [greetingEs, setGreetingEs] = useState(''); const [fallbackPhone, setFallbackPhone] = useState(''); 
+
+// Phone linking state - 'skip', 'random', or 'select' const [phoneSetupMode, setPhoneSetupMode] = useState('skip'); const [selectedPhone, setSelectedPhone] = useState<SelectedPhoneInfo | null>(null); 
+
+// Knowledge base state const [businessKnowledge, setBusinessKnowledge] = useState({ businessName: '', address: '', phone: '', email: '', websiteUrl: '', operatingHours: '', timezone: '', primaryCuisine: '', socialMedia: { instagram: '', facebook: '', twitter: '' }, socialMediaOther: [], reservationPolicy: '', cancellationPolicy: '', seatingCapacity: '', serviceAreas: [], paymentMethods: { visa: true, mastercard: true, amex: false, discover: false, cash: true, applePay: false, googlePay: false, }, paymentMethodsOther: [], dietaryOptions: { vegetarian: false, vegan: false, glutenFree: false, halal: false, kosher: false, dairyFree: false, }, dietaryOptionsOther: [], allergenInfo: '', kidsMenu: false, highChairs: false, familyFriendlyFeatures: '', petPolicy: { dogsAllowedInside: false, dogsAllowedOutside: false, noPetsAllowed: false }, petPolicyDetails: '', accessibility: { wheelchairEntrance: false, wheelchairRestroom: false, wheelchairSeating: false }, accessibilityDetails: '', ambiance: { quiet: false, moderate: false, lively: false }, ambianceDetails: '', dressCode: { casual: false, smartCasual: false, businessCasual: false, formal: false }, menuHighlights: [], signatureDish: '', parkingDetails: '', specialServices: '', faqs: [], aboutUs: '', otherInfo: '', }); 
+
+// Launch state const [isLaunching, setIsLaunching] = useState(false); const [launchProgress, setLaunchProgress] = useState(''); 
+
+// Toast restaurant info query const { data: toastRestaurantInfo, isLoading: isLoadingToastInfo, error: toastInfoError } = useToastRestaurantInfo(toastGuidToFetch); 
+
+const currentStepIndex = STEPS.findIndex((s) => s.id === currentStep); const progressPercentage = ((currentStepIndex + 1) / STEPS.length) * 100; 
+
+// Check if already authenticated on mount useEffect(() => { if (isAuthenticated) { setIsVerified(true); // Skip to next step if already verified const saved = localStorage.getItem(STORAGE_KEY); if (!saved) { setCurrentStep('toast-connect'); } } }, [isAuthenticated]); 
+
+// Restore state on mount useEffect(() => { const saved = localStorage.getItem(STORAGE_KEY); if (saved) { try { const state = JSON.parse(saved); const ageMinutes = (Date.now() - state.timestamp) / 1000 / 60; if (ageMinutes < 1440) { if (state.currentStep) setCurrentStep(state.currentStep); if (state.isVerified) setIsVerified(state.isVerified); if (state.phoneNumber) setPhoneNumber(state.phoneNumber); if (state.merchant) setMerchant(state.merchant); if (state.config) setConfig(state.config); if (state.agent) setAgent(state.agent); if (state.agentName) setAgentName(state.agentName); if (state.selectedVoiceId) setSelectedVoiceId(state.selectedVoiceId); if (state.selectedLanguages) setSelectedLanguages(state.selectedLanguages); if (state.greetingEn) setGreetingEn(state.greetingEn); if (state.greetingEs) setGreetingEs(state.greetingEs); if (state.fallbackPhone) setFallbackPhone(state.fallbackPhone); if (state.selectedProvider) setSelectedProvider(state.selectedProvider); if (state.providerConfirmed !== undefined) setProviderConfirmed(state.providerConfirmed); if (state.toastGuid) setToastGuid(state.toastGuid); if (state.pendingToastData) setPendingToastData(state.pendingToastData); if (state.step1DataCollected !== undefined) setStep1DataCollected(state.step1DataCollected); if (state.businessKnowledge) setBusinessKnowledge(state.businessKnowledge); if (state.phoneSetupMode !== undefined) setPhoneSetupMode(state.phoneSetupMode as PhoneSetupMode); if (state.selectedPhone) setSelectedPhone(state.selectedPhone); if (state.businessForm) setBusinessForm(state.businessForm); if (state.codeValid !== undefined) setCodeValid(state.codeValid); if (state.businessDetailsComplete !== undefined) setBusinessDetailsComplete(state.businessDetailsComplete); if (state.identityMerchantId) setIdentityMerchantId(state.identityMerchantId); if (state.locationId) setLocationId(state.locationId); if (state.provisionedPhoneNumber) setProvisionedPhoneNumber(state.provisionedPhoneNumber); if (state.phoneProvisioningError) setPhoneProvisioningError(state.phoneProvisioningError); if (state.ivrProvider) setIvrProvider(state.ivrProvider); } } catch (error) { console.error('Failed to restore onboarding state:', error); } } }, []); 
+
+// Save state to localStorage useEffect(() => { const state = { currentStep, isVerified, phoneNumber, merchant, config, agent, agentName, selectedVoiceId, selectedLanguages, greetingEn, greetingEs, fallbackPhone, selectedProvider, providerConfirmed, toastGuid, pendingToastData, step1DataCollected, businessKnowledge, phoneSetupMode, selectedPhone, businessForm, codeValid, businessDetailsComplete, identityMerchantId, locationId, provisionedPhoneNumber, phoneProvisioningError, ivrProvider, timestamp: Date.now(), }; localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); }, [ currentStep, isVerified, phoneNumber, merchant, config, agent, agentName, selectedVoiceId, selectedLanguages, greetingEn, greetingEs, fallbackPhone, selectedProvider, providerConfirmed, toastGuid, pendingToastData, step1DataCollected, businessKnowledge, phoneSetupMode, selectedPhone, businessForm, codeValid, businessDetailsComplete, identityMerchantId, locationId, provisionedPhoneNumber, phoneProvisioningError, ivrProvider, ]); 
+
+// Pre-fill FAQs when domain is set useEffect(() => { const businessDomain = pendingToastData?.businessDomain; if (businessDomain && businessKnowledge.faqs.length === 0) { const defaultFaqs = DEFAULT_FAQS[businessDomain] || DEFAULT_FAQS.restaurant; setBusinessKnowledge((prev) => ({ ...prev, faqs: defaultFaqs.map((faq) => ({ ...faq })), })); } }, [pendingToastData?.businessDomain]); 
+
+// Steps to skip based on provider selection const shouldSkipStep = useCallback((stepId: WizardStep): boolean => { if (ivrProvider === 'parcera_voice') { // Parcera Voice: skip ElevenLabs-specific voice customization if (stepId === 'customize-voice') return true; } return false; }, [ivrProvider]); 
+
+const goToNextStep = useCallback(() => { let nextIndex = currentStepIndex + 1; // Skip steps that aren't relevant for the selected provider while (nextIndex < STEPS.length && shouldSkipStep(STEPS[nextIndex].id)) { nextIndex++; } if (nextIndex < STEPS.length) { setCurrentStep(STEPS[nextIndex].id); } }, [currentStepIndex, shouldSkipStep]); 
+
+const goToPrevStep = useCallback(() => { let prevIndex = currentStepIndex - 1; while (prevIndex >= 0 && shouldSkipStep(STEPS[prevIndex].id)) { prevIndex--; } if (prevIndex >= 0) { setCurrentStep(STEPS[prevIndex].id); } }, [currentStepIndex, shouldSkipStep]); 
+
+// Phone verification handlers const handleSendOtp = async () => { const validation = validatePhoneVerification({ phoneNumber }); if (!validation.success) { toast.error(getFirstError(validation) || 'Please enter a valid phone number'); return; } 
+
+setPhoneLoading(true); 
+try { 
+ const response = await authService.sendOtp({ phone: phoneNumber }); 
+ toast.success(response.message || 'OTP sent successfully'); 
+ setOtpSent(true); 
+} catch (error: any) { 
+ toast.error(error.response?.data?.message || 'Failed to send OTP'); 
+} finally { 
+ setPhoneLoading(false); 
+} 
+ 
+
+}; 
+
+const handleGetOtp = async () => { setPhoneLoading(true); try { const response = await authService.getOtp(phoneNumber); const otpValue = (response as any).otp || (response as any).data?.otp; 
+
+if (otpValue) { 
+   setFetchedOtp(otpValue); 
+   setOtp(otpValue); 
+   toast.success(`OTP: ${otpValue} (Dev Mode)`, { duration: 10000 }); 
+ } else { 
+   toast.error('OTP not found in response'); 
+ } 
+} catch (error: any) { 
+ toast.error('Failed to fetch OTP'); 
+} finally { 
+ setPhoneLoading(false); 
+} 
+ 
+
+}; 
+
+const handleVerifyOtp = async () => { if (!otp.trim()) { toast.error('Please enter the OTP'); return; } 
+
+setPhoneLoading(true); 
+try { 
+ const response = await authService.verifyOtp({ phone: phoneNumber, otp }); 
+ 
+ // Extract tokens and user from response 
+ const { accessToken, refreshToken, sessionId, user } = response as any; 
+ 
+ // Login user 
+ login( 
+   user, 
+   { accessToken, refreshToken, sessionId }, 
+   [] 
+ ); 
+ 
+ setIsVerified(true); 
+ // Pre-fill contact phone with verified phone 
+ setBusinessForm(prev => ({ ...prev, contactPhone: phoneNumber })); 
+ toast.success('Phone verified successfully!'); 
+ goToNextStep(); 
+} catch (error: any) { 
+ toast.error(error.response?.data?.message || 'Invalid OTP'); 
+} finally { 
+ setPhoneLoading(false); 
+} 
+ 
+
+}; 
+
+// Validate activation code const validateActivationCode = async (code: string) => { if (!code || code.length < 5) { setCodeValid(null); return; } 
+
+setCodeChecking(true); 
+try { 
+ const response = await merchantService.validateActivationCode(code); 
+ const isValid = (response as any).valid || (response as any).data?.valid || false; 
+ setCodeValid(isValid); 
+} catch (error) { 
+ setCodeValid(false); 
+} finally { 
+ setCodeChecking(false); 
+} 
+ 
+
+}; 
+
+// Generate activation code const handleGenerateActivationCode = async () => { const { user } = useAuthStore.getState(); if (!user) { toast.error('You must be verified to generate a code'); return; } 
+
+setBusinessFormLoading(true); 
+try { 
+ const res = await merchantService.generateActivationCode({ 
+   codeType: 'merchant', 
+   tenantId: HARDCODED_TENANT_ID, 
+   validityHours: 48, 
+   createdBy: user.id 
+ }); 
+ const code = (res as any).code || (res as any).data?.code; 
+ 
+ if (code) { 
+   setBusinessForm(prev => ({ ...prev, activationCode: code })); 
+   validateActivationCode(code); 
+   toast.success('Activation code generated!'); 
+ } else { 
+   toast.error('Failed to parse generated code'); 
+ } 
+} catch (err: any) { 
+ toast.error(err.response?.data?.message || 'Failed to generate code'); 
+} finally { 
+ setBusinessFormLoading(false); 
+} 
+ 
+
+}; 
+
+// Validate business form and proceed to next step (no API calls - all calls happen at launch) const handleValidateBusinessDetails = () => { // Validate with Zod schema const validation = validateBusinessDetails(businessForm); if (!validation.success) { toast.error(getFirstError(validation) || 'Please fill in all required fields'); return; } 
+
+if (codeValid === false) { 
+ toast.error('Please enter a valid activation code'); 
+ return; 
+} 
+ 
+// Just mark as complete and proceed - API calls happen at launch 
+setBusinessDetailsComplete(true); 
+toast.success('Business details saved!'); 
+goToNextStep(); 
+ 
+
+}; 
+
+// Handle fetching Toast restaurant info const handleFetchToastInfo = () => { const extracted = extractToastGuid(toastGuid); const validation = validateToastConnect({ toastGuid: extracted }); if (!validation.success) { toast.error(getFirstError(validation) || 'Please enter a valid Toast Tables URL or GUID'); return; } setToastGuid(extracted); setToastGuidToFetch(extracted); }; 
+
+// Handle collecting merchant data from Toast info const handleCollectFromToast = async () => { if (!toastRestaurantInfo) return; 
+
+setIsCreatingFromToast(true); 
+ 
+try { 
+ const formattedAddress = [ 
+   toastRestaurantInfo.address.street, 
+   toastRestaurantInfo.address.city, 
+   toastRestaurantInfo.address.state, 
+   toastRestaurantInfo.address.zipCode, 
+ ] 
+   .filter(Boolean) 
+   .join(', '); 
+ 
+ setPendingToastData({ 
+   businessName: toastRestaurantInfo.name, 
+   businessDomain: 'restaurant' as BusinessDomain, 
+   phone: toastRestaurantInfo.contact.phone || '', 
+   address: formattedAddress, 
+   restaurantGuid: toastGuid.trim(), 
+ }); 
+ 
+ // Pre-fill the business form with Toast data 
+ setBusinessForm((prev) => ({ 
+   ...prev, 
+   name: toastRestaurantInfo.name || prev.name, 
+   businessType: 'restaurant', 
+   contactEmail: toastRestaurantInfo.contact?.email || prev.contactEmail, 
+   contactPhone: toastRestaurantInfo.contact?.phone || phoneNumber || prev.contactPhone, 
+   address: formattedAddress || prev.address, 
+ })); 
+ 
+ // Set up default greetings 
+ if (!greetingEn) { 
+   setGreetingEn(`Hello! Thank you for calling ${toastRestaurantInfo.name}. How can I help you today?`); 
+ } 
+ if (!agentName) { 
+   setAgentName(`${toastRestaurantInfo.name} Assistant`); 
+ } 
+ 
+ // Update businessKnowledge with Toast data 
+ setBusinessKnowledge((prev) => ({ 
+   ...prev, 
+   businessName: toastRestaurantInfo.name || prev.businessName, 
+   address: formattedAddress || prev.address, 
+   phone: toastRestaurantInfo.contact?.phone || prev.phone, 
+   email: toastRestaurantInfo.contact?.email || prev.email, 
+   websiteUrl: toastRestaurantInfo.contact?.website || prev.websiteUrl, 
+   timezone: toastRestaurantInfo.timezone || prev.timezone, 
+   primaryCuisine: toastRestaurantInfo.primaryCuisine || prev.primaryCuisine, 
+   socialMedia: { 
+     instagram: toastRestaurantInfo.social?.instagram || prev.socialMedia.instagram, 
+     facebook: toastRestaurantInfo.social?.facebook || prev.socialMedia.facebook, 
+     twitter: toastRestaurantInfo.social?.twitter || prev.socialMedia.twitter, 
+   }, 
+   reservationPolicy: toastRestaurantInfo.policies?.reservation || prev.reservationPolicy, 
+   cancellationPolicy: toastRestaurantInfo.policies?.cancellation || prev.cancellationPolicy, 
+   serviceAreas: toastRestaurantInfo.serviceAreaNames || prev.serviceAreas, 
+   aboutUs: toastRestaurantInfo.description || prev.aboutUs, 
+ })); 
+ 
+ setStep1DataCollected(true); 
+ toast.success('Restaurant information saved!'); 
+ goToNextStep(); 
+} catch (error: unknown) { 
+ const message = error instanceof Error ? error.message : 'Failed to save restaurant information'; 
+ toast.error(message); 
+} finally { 
+ setIsCreatingFromToast(false); 
+} 
+ 
+
+}; 
+
+/** 
+
+Handle launch - Uses the correct 6-step location-based API flow from Postman collection: 
+
+ 
+
+Reservation provider (already done in business-details step) 
+
+ 
+
+Create agent 
+
+ 
+
+Setup tools for agent 
+
+ 
+
+Generate system prompt 
+
+ 
+
+Create knowledge base 
+
+ 
+
+Sync knowledge base to ElevenLabs 
+
+ 
+
+This function is designed to be resilient: 
+
+ 
+
+Saves agent state after creation to allow resuming 
+
+ 
+
+Non-critical steps (KB, Spanish) fail gracefully 
+
+ 
+
+Progress is persisted so interrupted launches can continue 
+
+*/ const handleLaunch = async () => { const businessName = pendingToastData?.businessName || businessForm.name; 
+
+// Validate voice customization with Zod schema (only for ElevenLabs) 
+if (ivrProvider !== 'parcera_voice') { 
+ const voiceValidation = validateVoiceCustomization({ 
+   agentName, 
+   selectedVoiceId, 
+   greetingEn, 
+   greetingEs, 
+   fallbackPhone, 
+   selectedLanguages, 
+ }); 
+ if (!voiceValidation.success) { 
+   toast.error(getFirstError(voiceValidation) || 'Please complete all fields before launching'); 
+   return; 
+ } 
+} 
+ 
+if (!businessName) { 
+ toast.error('Business name is missing. Please go back and complete setup.'); 
+ return; 
+} 
+ 
+// Validate business details are complete 
+if (!businessDetailsComplete) { 
+ toast.error('Business details incomplete. Please go back and complete setup.'); 
+ return; 
+} 
+ 
+setIsLaunching(true); 
+ 
+// Track which steps have completed for error reporting 
+let completedSteps: string[] = []; 
+let currentAgent = agent; // Use existing agent if resuming 
+let currentMerchantId = identityMerchantId; 
+let currentLocationId = locationId; 
+ 
+try { 
+ const { user } = useAuthStore.getState(); 
+ 
+ // STEP 1: Create merchant (skip if already created from previous attempt) 
+ if (!currentMerchantId) { 
+   setLaunchProgress('Registering your business...'); 
+   console.log('[Launch] Creating merchant...'); 
+   const merchantResponse = await merchantService.create({ 
+     name: businessForm.name, 
+     businessType: businessForm.businessType, 
+     contactEmail: businessForm.contactEmail, 
+     contactPhone: businessForm.contactPhone, 
+     address: businessForm.address, 
+     activationCode: businessForm.activationCode, 
+     tenantId: HARDCODED_TENANT_ID, 
+     createdBy: user?.id || 'system', 
+   }); 
+ 
+   const createdMerchant = (merchantResponse as any)?.data || merchantResponse; 
+   currentMerchantId = createdMerchant?.id; 
+ 
+   if (!currentMerchantId) { 
+     throw new Error('Failed to get merchant ID from response'); 
+   } 
+ 
+   setIdentityMerchantId(currentMerchantId); 
+   console.log('[Launch] Merchant created:', currentMerchantId); 
+ } else { 
+   console.log('[Launch] Resuming with existing merchant:', currentMerchantId); 
+ } 
+ completedSteps.push('merchant_created'); 
+ 
+ // STEP 2: Create location (skip if already created) 
+ if (!currentLocationId) { 
+   setLaunchProgress('Setting up your location...'); 
+   const timezone = pendingToastData ? 
+     (businessKnowledge.timezone || 'America/New_York') : 
+     'America/New_York'; 
+ 
+   console.log('[Launch] Creating location for merchant:', currentMerchantId); 
+   const locationResponse = await locationService.create({ 
+     merchantId: currentMerchantId, 
+     name: businessForm.name, 
+     address: businessForm.address || '', 
+     timezone: timezone, 
+   }); 
+ 
+   const createdLocation = (locationResponse as any)?.data || locationResponse; 
+   currentLocationId = createdLocation?.id; 
+ 
+   if (!currentLocationId) { 
+     throw new Error('Failed to get location ID from response'); 
+   } 
+ 
+   setLocationId(currentLocationId); 
+   console.log('[Launch] Location created:', currentLocationId); 
+ } else { 
+   console.log('[Launch] Resuming with existing location:', currentLocationId); 
+ } 
+ completedSteps.push('location_created'); 
+ 
+ // STEP 3: Create reservation config (if Toast data exists, non-fatal) 
+ if (pendingToastData?.restaurantGuid) { 
+   setLaunchProgress('Connecting reservation system...'); 
+   try { 
+     console.log('[Launch] Creating reservation config...'); 
+     await locationReservationService.createConfig( 
+       currentLocationId, 
+       'toast_tables', 
+       pendingToastData.restaurantGuid, 
+       HARDCODED_TENANT_ID 
+     ); 
+     console.log('[Launch] Reservation config created'); 
+     completedSteps.push('reservation_config_created'); 
+   } catch (configError: unknown) { 
+     console.warn('[Launch] Reservation config warning (non-fatal):', configError); 
+     // Non-fatal: we can still proceed 
+   } 
+ } 
+ 
+ // STEP 4: Create agent (skip if already created from previous attempt) 
+ if (!currentAgent?.agentIdExternal) { 
+   setLaunchProgress('Creating your voice assistant...'); 
+ 
+   if (ivrProvider === 'parcera_voice') { 
+     // Parcera Voice: agent config is stored in DB, read by agent.py at call time 
+     const basicSystemPrompt = `You are a friendly and professional AI assistant for ${businessName}. 
+ 
+
+You help customers with reservations and answer questions about the restaurant. Be helpful, concise, and maintain a warm, welcoming tone.`; 
+
+    console.log('[Launch] Creating Parcera Voice agent for location:', currentLocationId); 
+     const agentResult = await agentService.create(currentLocationId, { 
+       provider: 'parcera_voice', 
+       agentName: `parcera-agent-${businessName.toLowerCase().replace(/\s+/g, '-')}`, 
+       voiceId: 'eleven_flash_v2_5', // Default TTS voice used by agent.py 
+       firstMessage: `Hello! Thank you for calling ${businessName}. How can I help you today?`, 
+       systemPrompt: basicSystemPrompt, 
+       language: 'en', 
+       llmModel: 'gpt-4', 
+       temperature: 0.4, 
+       fallbackPhone: fallbackPhone || businessForm.contactPhone || undefined, 
+     }); 
+     currentAgent = agentResult; 
+     setAgent(agentResult); 
+     console.log('[Launch] Parcera Voice agent created:', agentResult.agentIdExternal); 
+   } else { 
+     // ElevenLabs: managed agent with voice selection 
+     const basicSystemPrompt = `You are ${agentName}, a friendly and professional AI assistant for ${businessName}. 
+ 
+
+You help customers with reservations and answer questions about the restaurant. Be helpful, concise, and maintain a warm, welcoming tone.`; 
+
+    console.log('[Launch] Creating ElevenLabs agent for location:', currentLocationId); 
+     const agentResult = await agentService.create(currentLocationId, { 
+       provider: 'elevenlabs', 
+       agentName: agentName, 
+       voiceId: selectedVoiceId, 
+       firstMessage: greetingEn, 
+       systemPrompt: basicSystemPrompt, 
+       language: 'en', 
+       llmModel: 'gemini-2.5-flash', 
+       temperature: 0.4, 
+       fallbackPhone: fallbackPhone || undefined, 
+     }); 
+     currentAgent = agentResult; 
+     setAgent(agentResult); 
+     console.log('[Launch] ElevenLabs agent created:', agentResult.agentIdExternal); 
+   } 
+ } else { 
+   console.log('[Launch] Resuming with existing agent:', currentAgent.agentIdExternal); 
+ } 
+ completedSteps.push('agent_created'); 
+ 
+ // STEP 4.5: Provision and link phone number (if mode is 'random' or 'select') 
+ const shouldProvisionPhone = (phoneSetupMode === 'random' || phoneSetupMode === 'select') && currentLocationId && currentAgent?.agentIdExternal; 
+ if (shouldProvisionPhone) { 
+   setLaunchProgress('Preparing phone number...'); 
+   try { 
+     // CRITICAL: Clean up existing phone numbers first 
+     // This ensures the phone can be re-provisioned cleanly for a new agent 
+     // Without this, ElevenLabs will reject re-provisioning if the phone is still linked 
+     console.log('[Launch] === PHONE NUMBER CLEANUP & PROVISIONING ==='); 
+     console.log('[Launch] Step 1: Cleaning up existing phone numbers...'); 
+ 
+     const cleanedUp = await phoneNumberService.cleanupAllForLocation(currentLocationId); 
+     if (cleanedUp > 0) { 
+       console.log(`[Launch] Cleaned up ${cleanedUp} existing phone number(s)`); 
+       // Wait for ElevenLabs to fully process the deletion 
+       await new Promise(resolve => setTimeout(resolve, 2000)); 
+     } else { 
+       console.log('[Launch] No existing phones to clean up'); 
+     } 
+ 
+     // Provision based on mode 
+     let provisionResult; 
+     const phoneLabel = `${businessName} - Main Line`; 
+ 
+     if (phoneSetupMode === 'select' && selectedPhone) { 
+       if (selectedPhone.source === 'pool' && selectedPhone.poolNumberId) { 
+         setLaunchProgress('Assigning selected number from pool...'); 
+         console.log('[Launch] Step 2: Assigning pool number:', selectedPhone.phoneNumber); 
+         provisionResult = await phoneNumberService.provisionFromPool( 
+           currentLocationId, 
+           selectedPhone.poolNumberId, 
+           phoneLabel, 
+           undefined, 
+           ivrProvider 
+         ); 
+       } else { 
+         setLaunchProgress('Purchasing selected number...'); 
+         console.log('[Launch] Step 2: Purchasing selected number:', selectedPhone.phoneNumber); 
+         provisionResult = await phoneNumberService.provisionSelected( 
+           currentLocationId, 
+           selectedPhone.phoneNumber, 
+           phoneLabel, 
+           undefined, 
+           ivrProvider 
+         ); 
+       } 
+     } else { 
+       setLaunchProgress('Provisioning random toll-free number...'); 
+       console.log('[Launch] Step 2: Provisioning random toll-free number for location:', currentLocationId); 
+       provisionResult = await phoneNumberService.provisionRandom( 
+         currentLocationId, 
+         phoneLabel, 
+         undefined, 
+         ivrProvider 
+       ); 
+     } 
+ 
+     const provisionedPhone = provisionResult.data; 
+     console.log('[Launch] Phone provisioned:', provisionedPhone.phoneNumber, 'isNew:', provisionResult.isNew); 
+ 
+     // Link to agent 
+     console.log('[Launch] Step 3: Linking phone to agent:', currentAgent.agentIdExternal); 
+     const linkedPhone = await phoneNumberService.linkToAgent( 
+       currentLocationId, 
+       provisionedPhone.id, 
+       currentAgent.agentIdExternal! 
+     ); 
+ 
+     setProvisionedPhoneNumber(linkedPhone.data); 
+     console.log('[Launch] Phone linked successfully'); 
+     console.log('[Launch] === PHONE NUMBER SETUP COMPLETE ==='); 
+     completedSteps.push('phone_provisioned_and_linked'); 
+   } catch (phoneError: unknown) { 
+     // Non-fatal: log error and continue 
+     const errorMessage = phoneError instanceof Error ? phoneError.message : 'Unknown error'; 
+     console.warn('[Launch] Phone provisioning warning (non-fatal):', errorMessage); 
+     setPhoneProvisioningError(errorMessage); 
+     // Don't throw - continue with onboarding 
+   } 
+ } 
+ 
+ // STEP 5: Setup tools for agent (auto-creates and links) 
+ setLaunchProgress('Setting up AI capabilities...'); 
+ try { 
+   console.log('[Launch] Setting up tools for agent:', currentAgent.agentIdExternal); 
+   const toolResult = await agentService.setupTools(currentLocationId!, currentAgent.agentIdExternal!); 
+   console.log('[Launch] Tools setup complete:', toolResult); 
+ 
+   const createdTools = (toolResult.tools || []).map((t) => ({ 
+     id: t.externalId || '', 
+     name: t.name, 
+     description: '', 
+     externalId: t.externalId, 
+     schema: { type: 'function' }, 
+     lifecycleStatus: t.status === 'created' ? ('active' as const) : ('stale' as const), 
+     merchantId: currentMerchantId, 
+     configVersion: 1, 
+     createdAt: new Date(), 
+     updatedAt: new Date(), 
+   })) as Tool[]; 
+   setTools(createdTools); 
+   completedSteps.push('tools_setup'); 
+ } catch (toolError: unknown) { 
+   console.warn('[Launch] Tools setup warning (non-fatal):', toolError); 
+   // Tools setup can fail if already done - continue anyway 
+ } 
+ 
+ // STEP 6: Generate system prompt 
+ setLaunchProgress('Generating conversation intelligence...'); 
+ try { 
+   console.log('[Launch] Generating system prompt for agent:', currentAgent.agentIdExternal); 
+   await agentService.generatePrompt(currentLocationId!, currentAgent.agentIdExternal!); 
+   console.log('[Launch] System prompt generated'); 
+   completedSteps.push('prompt_generated'); 
+ } catch (promptError: unknown) { 
+   console.warn('[Launch] Prompt generation warning (non-fatal):', promptError); 
+   // Prompt generation can fail if already done - continue anyway 
+ } 
+ 
+ // STEP 7: Create Knowledge Base (non-fatal) 
+ setLaunchProgress('Setting up knowledge base...'); 
+ try { 
+   console.log('[Launch] Creating knowledge base for location:', currentLocationId); 
+   await knowledgeBaseService.create(currentLocationId!); 
+   console.log('[Launch] Knowledge base created'); 
+   completedSteps.push('kb_created'); 
+ 
+   // Add business knowledge entries 
+   const kbEntries = transformBusinessKnowledgeToEntries(businessKnowledge); 
+   if (kbEntries.length > 0) { 
+     console.log('[Launch] Bulk updating KB with', kbEntries.length, 'entries'); 
+     await knowledgeBaseService.bulkUpdateEntries(currentLocationId!, { entries: kbEntries }); 
+     completedSteps.push('kb_entries_added'); 
+   } 
+ 
+   // STEP 8: Sync knowledge base to provider (only ElevenLabs needs API sync) 
+   if (ivrProvider !== 'parcera_voice') { 
+     setLaunchProgress('Syncing knowledge base to AI...'); 
+     console.log('[Launch] Syncing KB to ElevenLabs'); 
+     await knowledgeBaseService.sync(currentLocationId!); 
+     console.log('[Launch] KB synced successfully'); 
+     completedSteps.push('kb_synced'); 
+   } else { 
+     console.log('[Launch] Parcera Voice: KB is read from DB by agent.py, skipping ElevenLabs sync'); 
+     completedSteps.push('kb_synced'); 
+   } 
+ } catch (kbError: unknown) { 
+   console.warn('[Launch] Knowledge base setup warning (non-fatal):', kbError); 
+   // Non-fatal: KB is optional, agent can still work 
+ } 
+ 
+ // OPTIONAL: Add Spanish support if enabled (non-fatal, ElevenLabs only) 
+ if (ivrProvider !== 'parcera_voice' && selectedLanguages.includes('es') && greetingEs && currentAgent.agentIdExternal) { 
+   setLaunchProgress('Adding Spanish language support...'); 
+   try { 
+     console.log('[Launch] Adding Spanish support'); 
+     await agentService.update(currentLocationId!, currentAgent.agentIdExternal, { 
+       supportedLanguages: ['en', 'es'], 
+       primaryLanguage: 'en', 
+       firstMessageEn: greetingEn, 
+       firstMessageEs: greetingEs, 
+     }); 
+     completedSteps.push('spanish_added'); 
+   } catch (spanishError: unknown) { 
+     console.warn('[Launch] Spanish language setup warning (non-fatal):', spanishError); 
+     // Non-fatal: Spanish is optional 
+   } 
+ } 
+ 
+ // SUCCESS! 
+ const successMessage = provisionedPhoneNumber 
+   ? `Your AI assistant is ready! Phone number ${provisionedPhoneNumber.phoneNumber} is active.` 
+   : 'Your AI assistant is ready!'; 
+ setLaunchProgress(successMessage); 
+ toast.success('Your AI assistant is now live! Please log in to access your dashboard.'); 
+ 
+ // Show phone number in toast if provisioned 
+ if (provisionedPhoneNumber) { 
+   toast.success(`Phone number ${provisionedPhoneNumber.phoneNumber} provisioned and linked!`, { 
+     duration: 5000 
+   }); 
+ } 
+ 
+ console.log('[Launch] SUCCESS! Agent is live:', currentAgent.agentIdExternal, 'Completed steps:', completedSteps); 
+ 
+ localStorage.removeItem(STORAGE_KEY); 
+ // Logout so user can access /login page (otherwise PublicRoute redirects to /) 
+ logout(); 
+ navigate('/login'); 
+ 
+ onComplete?.(); 
+} catch (error: unknown) { 
+ console.error('[Launch] Error:', error, 'Completed steps:', completedSteps); 
+ 
+ // Provide helpful error message based on what failed 
+ let userMessage = 'Something went wrong. '; 
+ if (completedSteps.includes('agent_created')) { 
+   userMessage += 'Your assistant was created but setup is incomplete. You can try launching again to complete the setup.'; 
+ } else { 
+   userMessage += 'Failed to create your assistant. Please try again.'; 
+ } 
+ 
+ const errorDetail = error instanceof Error ? error.message : ''; 
+ if (errorDetail) { 
+   userMessage += ` (${errorDetail})`; 
+ } 
+ 
+ toast.error(userMessage); 
+ setLaunchProgress(''); 
+} finally { 
+ setIsLaunching(false); 
+} 
+ 
+
+}; 
+
+// Check if can proceed to next step const canProceed = useCallback((): boolean => { switch (currentStep) { case 'verify-phone': return isVerified; case 'toast-connect': return step1DataCollected && !!pendingToastData; case 'business-details': return businessDetailsComplete; case 'provider-select': return !!ivrProvider; case 'customize-voice': return ( !!agentName.trim() && !!selectedVoiceId && !!greetingEn.trim() && !!fallbackPhone.trim() && (!selectedLanguages.includes('es') || !!greetingEs.trim()) ); case 'phone-linking': if (phoneSetupMode === 'select') return !!selectedPhone; return true; case 'knowledge-base': return true; case 'launch': return false; default: return false; } }, [currentStep, isVerified, step1DataCollected, pendingToastData, businessDetailsComplete, ivrProvider, agentName, selectedVoiceId, selectedLanguages, greetingEn, greetingEs, fallbackPhone, phoneSetupMode, selectedPhone]); 
+
+// Render step circle const renderStepCircle = (stepIndex: number) => { const isCompleted = currentStepIndex > stepIndex; const isActive = currentStepIndex === stepIndex; 
+
+if (isCompleted) { 
+ return ( 
+   <div className="w-6 h-6 rounded-full bg-gradient-to-br from-fuchsia-500 to-purple-600 flex items-center justify-center flex-shrink-0 shadow-sm"> 
+     <Check className="w-3 h-3 text-white" strokeWidth={3} /> 
+   </div> 
+ ); 
+} 
+ 
+if (isActive) { 
+ return ( 
+   <div className="w-6 h-6 rounded-full border-2 border-fuchsia-500 bg-fuchsia-50 flex items-center justify-center flex-shrink-0 animate-pulse"> 
+     <div className="w-2 h-2 rounded-full bg-gradient-to-br from-fuchsia-500 to-purple-600" /> 
+   </div> 
+ ); 
+} 
+ 
+return <div className="w-6 h-6 rounded-full border-2 border-slate-200 bg-white flex-shrink-0" />; 
+ 
+
+}; 
+
+// Render step content const renderStepContent = () => { switch (currentStep) { case 'verify-phone': return (  
+
+Verify Your Phone 
+
+{!otpSent ? 'Enter your phone number to get started' : Enter the code sent to ${phoneNumber}}  
+
+      <Card className="border-slate-200"> 
+         <CardBody className="p-6"> 
+           {!otpSent ? ( 
+             <div className="space-y-5"> 
+               <Input 
+                 label="Phone Number" 
+                 type="tel" 
+                 value={phoneNumber} 
+                 onChange={(e) => setPhoneNumber(e.target.value)} 
+                 placeholder="+1 (555) 123-4567" 
+                 leftIcon={<Phone className="w-5 h-5" />} 
+                 autoFocus 
+               /> 
+ 
+               <Button 
+                 onClick={handleSendOtp} 
+                 className="w-full" 
+                 loading={phoneLoading} 
+                 disabled={!phoneNumber.trim()} 
+               > 
+                 Send Verification Code 
+                 <ArrowRight className="w-4 h-4 ml-2" /> 
+               </Button> 
+ 
+               <div className="text-center"> 
+                 <p className="text-sm text-slate-500"> 
+                   Already have an account?{' '} 
+                   <Link 
+                     to="/login" 
+                     className="text-fuchsia-600 hover:text-fuchsia-700 font-medium" 
+                   > 
+                     Sign in 
+                   </Link> 
+                 </p> 
+               </div> 
+             </div> 
+           ) : ( 
+             <div className="space-y-5"> 
+               {fetchedOtp && ( 
+                 <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-3"> 
+                   <p className="text-sm text-yellow-700"> 
+                     <strong>Dev Mode:</strong> Your OTP is{' '} 
+                     <code className="bg-yellow-100 px-2 py-0.5 rounded font-mono"> 
+                       {fetchedOtp} 
+                     </code> 
+                   </p> 
+                 </div> 
+               )} 
+ 
+               <Button 
+               type="button" 
+               variant="ghost" 
+               onClick={handleGetOtp} 
+               disabled={phoneLoading} 
+               className=" 
+                 w-full 
+                 border border-fuchsia-200 
+                 text-fuchsia-600 
+                 bg-white 
+                 hover:bg-fuchsia-50 
+                 hover:text-fuchsia-700 
+                 hover:border-fuchsia-300 
+                 transition-colors 
+               " 
+             > 
+               Get OTP (Dev Mode) 
+             </Button> 
+ 
+ 
+               <Input 
+                 label="Verification Code" 
+                 type={showOtp ? 'text' : 'password'} 
+                 value={otp} 
+                 onChange={(e) => setOtp(e.target.value)} 
+                 placeholder="Enter 6-digit code" 
+                 autoFocus 
+                 maxLength={6} 
+                 rightIcon={ 
+                   <button 
+                     type="button" 
+                     onClick={() => setShowOtp(!showOtp)} 
+                     className="text-slate-400 hover:text-slate-600" 
+                   > 
+                     {showOtp ? <EyeOff className="w-5 h-5" /> : <Eye className="w-5 h-5" />} 
+                   </button> 
+                 } 
+               /> 
+ 
+               <Button 
+                 onClick={handleVerifyOtp} 
+                 className="w-full" 
+                 loading={phoneLoading} 
+                 disabled={!otp.trim()} 
+               > 
+                 Verify & Continue 
+                 <ArrowRight className="w-4 h-4 ml-2" /> 
+               </Button> 
+ 
+               <div className="flex justify-between text-sm"> 
+                 <button 
+                   type="button" 
+                   onClick={() => { 
+                     setOtpSent(false); 
+                     setOtp(''); 
+                     setFetchedOtp(''); 
+                   }} 
+                   className="text-fuchsia-600 hover:text-fuchsia-700 flex items-center gap-1" 
+                 > 
+                   <ArrowLeft className="w-4 h-4" /> 
+                   Change number 
+                 </button> 
+                 <button 
+                   type="button" 
+                   onClick={handleSendOtp} 
+                   disabled={phoneLoading} 
+                   className="text-slate-500 hover:text-slate-700" 
+                 > 
+                   Resend code 
+                 </button> 
+               </div> 
+             </div> 
+           )} 
+         </CardBody> 
+       </Card> 
+     </div> 
+   ); 
+ 
+ case 'toast-connect': 
+   return ( 
+     <div className="w-full"> 
+       {!providerConfirmed ? ( 
+         <div className="w-full min-h-[calc(100vh-280px)] flex flex-col"> 
+           <div className="mb-6"> 
+             <h2 className="text-xl font-semibold text-slate-900 mb-1">Connect Your Reservation System</h2> 
+             <p className="text-sm text-slate-600">Choose your reservation platform to get started</p> 
+           </div> 
+ 
+           <div className="flex-1 flex items-center justify-center -mt-8"> 
+             <div className="grid grid-cols-1 md:grid-cols-2 gap-8 max-w-2xl"> 
+               {/* Toast Tables */} 
+               <button 
+                 type="button" 
+                 className="w-full text-left cursor-pointer transition-all duration-300 rounded-3xl shadow-xl hover:shadow-2xl hover:scale-[1.03] focus:outline-none focus:ring-4 focus:ring-fuchsia-300 overflow-hidden bg-gradient-to-br from-pink-400 via-fuchsia-500 to-purple-500" 
+                 onClick={() => { 
+                   setSelectedProvider('toast_tables'); 
+                   setProviderConfirmed(true); 
+                 }} 
+               > 
+                 <div className="p-10"> 
+                   <div className="flex flex-col items-center text-center"> 
+                     <div className="w-20 h-20 rounded-2xl bg-white/20 flex items-center justify-center mb-5 shadow-lg"> 
+                       <svg 
+                         xmlns="http://www.w3.org/2000/svg" 
+                         viewBox="0 0 24 24" 
+                         className="w-10 h-10" 
+                         fill="none" 
+                         stroke="white" 
+                         strokeWidth={2} 
+                         strokeLinecap="round" 
+                         strokeLinejoin="round" 
+                       > 
+                         <path d="M6 19v-9c-1.5 0-2-1.5-2-2.5s.5-2 2-2.5c2.364-.643 4.2-.976 6-.989c1.8.013 3.636.346 6 .989c1.5.5 2 1.5 2 2.5s-.5 2.5-2 2.5v9a1 1 0 0 1-1 1H7a1 1 0 0 1-1-1" /> 
+                       </svg> 
+                     </div> 
+                     <h3 className="text-xl font-bold text-white mb-2">Toast Tables</h3> 
+                     <p className="text-sm text-white/90">Connect your Toast POS</p> 
+                   </div> 
+                 </div> 
+               </button> 
+ 
+               {/* Parcera Tables - Coming Soon */} 
+               <div className="cursor-not-allowed transition-all duration-300 rounded-3xl shadow-xl overflow-hidden relative bg-gradient-to-br from-fuchsia-500 via-purple-500 to-indigo-600"> 
+                 <div className="p-10"> 
+                   <div className="flex flex-col items-center text-center"> 
+                     <div className="w-20 h-20 rounded-2xl bg-white/20 flex items-center justify-center mb-5 shadow-lg"> 
+                       <Store className="w-10 h-10 text-white" /> 
+                     </div> 
+                     <h3 className="text-xl font-bold text-white mb-2">Parcera Tables</h3> 
+                     <p className="text-sm text-white/90">Native reservation system</p> 
+                   </div> 
+                 </div> 
+                 <div className="absolute top-4 right-4"> 
+                   <Badge className="bg-white text-slate-700 border-0 shadow-lg px-4 py-1.5 text-xs font-semibold"> 
+                     Coming Soon 
+                   </Badge> 
+                 </div> 
+               </div> 
+             </div> 
+           </div> 
+         </div> 
+       ) : ( 
+         <div className="space-y-5"> 
+           <div> 
+             <button 
+               onClick={() => { 
+                 setProviderConfirmed(false); 
+                 setToastGuid(''); 
+               }} 
+               className="inline-flex items-center text-sm text-slate-500 hover:text-slate-700 mb-4 transition-colors" 
+             > 
+               <ChevronLeft className="w-4 h-4 mr-1" /> 
+               Change provider 
+             </button> 
+             <h2 className="text-xl font-semibold text-slate-900 mb-1">Connect Toast Tables</h2> 
+             <p className="text-sm text-slate-600">Paste your Toast Tables booking URL or enter your Restaurant GUID</p> 
+           </div> 
+ 
+           <Card className="border border-slate-200"> 
+             <CardBody className="p-5"> 
+               {toastRestaurantInfo ? ( 
+                 <div className="flex items-center justify-between"> 
+                   <div className="flex items-center gap-3"> 
+                     <div className="w-10 h-10 rounded-lg bg-emerald-100 flex items-center justify-center"> 
+                       <CheckCircle2 className="w-5 h-5 text-emerald-600" /> 
+                     </div> 
+                     <div> 
+                       <p className="text-xs text-slate-500 font-medium">Restaurant GUID</p> 
+                       <p className="text-sm font-mono text-slate-900"> 
+                         {toastGuid.slice(0, 8)}...{toastGuid.slice(-4)} 
+                       </p> 
+                     </div> 
+                   </div> 
+                   <Button 
+                     variant="ghost" 
+                     size="sm" 
+                     onClick={() => setToastGuidToFetch('')} 
+                     className="text-xs text-slate-500 hover:text-slate-700" 
+                   > 
+                     <Pencil className="w-3 h-3 mr-1" /> 
+                     Change 
+                   </Button> 
+                 </div> 
+               ) : ( 
+                 <div className="space-y-4"> 
+                   <div> 
+                     <label className="text-sm font-medium text-slate-700 block mb-2">Toast Tables URL or GUID</label> 
+                     <div className="flex gap-3 w-full flex-col sm:flex-row"> 
+                       <Input 
+                         value={toastGuid} 
+                         onChange={(e) => setToastGuid(e.target.value)} 
+                         placeholder="e.g., https://tables.toasttab.com/restaurants/xxxx-xxxx/reserve?..." 
+                         className="flex-1 h-11 text-base w-full sm:min-w-[700px]" 
+                       /> 
+                       <Button onClick={handleFetchToastInfo} disabled={!toastGuid.trim() || isLoadingToastInfo} className="h-11 px-6 w-full sm:w-auto"> 
+                         {isLoadingToastInfo && <Loader2 className="mr-2 h-4 w-4 animate-spin" />} 
+                         {isLoadingToastInfo ? 'Loading...' : 'Fetch'} 
+                       </Button> 
+                     </div> 
+                   </div> 
+ 
+                   <div className="flex items-start gap-2 p-3 rounded-lg bg-slate-50 border border-slate-100"> 
+                     <Info className="h-4 w-4 text-slate-500 mt-0.5 flex-shrink-0" /> 
+                     <p className="text-xs text-slate-600"> 
+                       Paste your Toast Tables booking URL (e.g.,{' '} 
+                       <span className="font-medium font-mono text-[10px]">https://tables.toasttab.com/restaurants/xxxx/reserve?...</span> 
+                       ) and the GUID will be extracted automatically. You can also enter the GUID directly. 
+                     </p> 
+                   </div> 
+                 </div> 
+               )} 
+             </CardBody> 
+           </Card> 
+ 
+           {toastInfoError && !toastRestaurantInfo && ( 
+             <div className="bg-red-50 border border-red-200 rounded-lg p-3"> 
+               <div className="flex items-center gap-2"> 
+                 <AlertCircle className="h-4 w-4 text-red-600" /> 
+                 <p className="text-sm text-red-700"> 
+                   Could not find restaurant with this GUID. Please check and try again. 
+                 </p> 
+               </div> 
+             </div> 
+           )} 
+ 
+           {toastRestaurantInfo && ( 
+             <Card className="border border-slate-200"> 
+               <CardBody className="p-5"> 
+                 <div className="flex items-center justify-between mb-4"> 
+                   <div className="flex items-center gap-3"> 
+                     {toastRestaurantInfo.profilePicUrl ? ( 
+                       <img 
+                         src={toastRestaurantInfo.profilePicUrl} 
+                         alt={toastRestaurantInfo.name} 
+                         className="w-12 h-12 rounded-lg object-cover border border-slate-200" 
+                       /> 
+                     ) : ( 
+                       <div className="w-12 h-12 rounded-lg bg-slate-100 flex items-center justify-center"> 
+                         <Utensils className="w-6 h-6 text-slate-400" /> 
+                       </div> 
+                     )} 
+                     <div> 
+                       <h3 className="font-semibold text-slate-900">{toastRestaurantInfo.name}</h3> 
+                       {toastRestaurantInfo.primaryCuisine && ( 
+                         <p className="text-xs text-slate-500 mt-0.5">{toastRestaurantInfo.primaryCuisine}</p> 
+                       )} 
+                     </div> 
+                   </div> 
+                   <Badge className="bg-emerald-100 text-emerald-700 border-0 text-xs"> 
+                     <CheckCircle2 className="w-3 h-3 mr-1" /> 
+                     Found 
+                   </Badge> 
+                 </div> 
+ 
+                 <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4"> 
+                   <div className="flex items-start gap-3"> 
+                     <MapPin className="w-4 h-4 text-slate-400 mt-0.5 flex-shrink-0" /> 
+                     <div> 
+                       <p className="text-xs font-medium text-slate-500 uppercase tracking-wide">Address</p> 
+                       <p className="text-sm text-slate-900 mt-0.5"> 
+                         {toastRestaurantInfo.address.street}, {toastRestaurantInfo.address.city},{' '} 
+                         {toastRestaurantInfo.address.state} {toastRestaurantInfo.address.zipCode} 
+                       </p> 
+                     </div> 
+                   </div> 
+ 
+                   <div className="flex items-start gap-3"> 
+                     <Phone className="w-4 h-4 text-slate-400 mt-0.5 flex-shrink-0" /> 
+                     <div> 
+                       <p className="text-xs font-medium text-slate-500 uppercase tracking-wide">Phone</p> 
+                       <p className="text-sm text-slate-900 mt-0.5"> 
+                         {toastRestaurantInfo.contact.phone || 'Not available'} 
+                       </p> 
+                     </div> 
+                   </div> 
+ 
+                   <div className="flex items-start gap-3"> 
+                     <Clock className="w-4 h-4 text-slate-400 mt-0.5 flex-shrink-0" /> 
+                     <div> 
+                       <p className="text-xs font-medium text-slate-500 uppercase tracking-wide">Timezone</p> 
+                       <p className="text-sm text-slate-900 mt-0.5">{toastRestaurantInfo.timezone}</p> 
+                     </div> 
+                   </div> 
+                 </div> 
+ 
+                 <div className="pt-4 border-t border-slate-100 flex flex-col gap-3"> 
+                   <Button onClick={handleCollectFromToast} disabled={isCreatingFromToast} className="w-full"> 
+                     {isCreatingFromToast && <Loader2 className="mr-2 h-4 w-4 animate-spin" />} 
+                     {isCreatingFromToast ? 'Saving...' : 'Continue'} 
+                     {!isCreatingFromToast && <ChevronRight className="ml-2 h-4 w-4" />} 
+                   </Button> 
+                   <button 
+                     type="button" 
+                     onClick={() => { 
+                       setToastGuidToFetch(''); 
+                       setToastGuid(''); 
+                     }} 
+                     className="text-xs text-slate-500 hover:text-slate-700 transition-colors" 
+                   > 
+                     Not your restaurant? Try a different URL or GUID 
+                   </button> 
+                 </div> 
+               </CardBody> 
+             </Card> 
+           )} 
+         </div> 
+       )} 
+     </div> 
+   ); 
+ 
+ case 'business-details': 
+   return ( 
+     <div className="w-full max-w-lg mx-auto"> 
+       <div className="text-center mb-8"> 
+         <div className="inline-flex items-center justify-center w-16 h-16 rounded-2xl bg-gradient-to-br from-fuchsia-500 to-purple-600 mb-4"> 
+           <Building2 className="w-8 h-8 text-white" /> 
+         </div> 
+         <h2 className="text-2xl font-bold text-slate-900 mb-2">Confirm Business Details</h2> 
+         <p className="text-slate-500"> 
+           {pendingToastData ? 'We\'ve pre-filled your info from Toast. Please verify and add your activation code.' : 'Tell us about your business'} 
+         </p> 
+       </div> 
+ 
+       {pendingToastData && ( 
+         <div className="mb-4 p-3 bg-emerald-50 border border-emerald-200 rounded-lg"> 
+           <div className="flex items-center gap-2"> 
+             <CheckCircle2 className="w-4 h-4 text-emerald-600" /> 
+             <p className="text-sm text-emerald-700"> 
+               Pre-filled from <strong>{pendingToastData.businessName}</strong> 
+             </p> 
+           </div> 
+         </div> 
+       )} 
+ 
+       <Card className="border-slate-200"> 
+         <CardBody className="p-6"> 
+           <div className="space-y-5"> 
+             <Input 
+               label="Business Name *" 
+               value={businessForm.name} 
+               onChange={(e) => setBusinessForm({ ...businessForm, name: e.target.value })} 
+               placeholder="Joe's Pizza" 
+               leftIcon={<Store className="w-5 h-5" />} 
+               disabled={!!pendingToastData} 
+               className={pendingToastData ? 'bg-slate-50 text-slate-600 cursor-not-allowed' : ''} 
+             /> 
+ 
+             <Select 
+               label="Business Type *" 
+               options={BUSINESS_TYPE_OPTIONS} 
+               value={businessForm.businessType} 
+               onChange={(value) => setBusinessForm({ ...businessForm, businessType: value })} 
+             /> 
+ 
+             <Input 
+               label="Contact Email *" 
+               type="email" 
+               value={businessForm.contactEmail} 
+               onChange={(e) => setBusinessForm({ ...businessForm, contactEmail: e.target.value })} 
+               placeholder="contact@yourbusiness.com" 
+               leftIcon={<Mail className="w-5 h-5" />} 
+             /> 
+ 
+             <Input 
+               label="Contact Phone" 
+               type="tel" 
+               value={businessForm.contactPhone} 
+               onChange={(e) => setBusinessForm({ ...businessForm, contactPhone: e.target.value })} 
+               placeholder="+1 (555) 123-4567" 
+               leftIcon={<Phone className="w-5 h-5" />} 
+             /> 
+ 
+             <Input 
+               label="Business Address" 
+               value={businessForm.address} 
+               onChange={(e) => setBusinessForm({ ...businessForm, address: e.target.value })} 
+               placeholder="123 Main St, City, State 12345" 
+               leftIcon={<MapPin className="w-5 h-5" />} 
+             /> 
+ 
+             <div> 
+               <div className="flex items-start gap-2"> 
+                 <div className="flex-1"> 
+                   <Input 
+                     label="Activation Code *" 
+                     value={businessForm.activationCode} 
+                     onChange={(e) => { 
+                       setBusinessForm({ ...businessForm, activationCode: e.target.value }); 
+                       validateActivationCode(e.target.value); 
+                     }} 
+                     placeholder="MERCHANT-XXX-XXX" 
+                     leftIcon={<Key className="w-5 h-5" />} 
+                     rightIcon={ 
+                       codeChecking ? ( 
+                         <Loader2 className="w-5 h-5 animate-spin text-fuchsia-600" /> 
+                       ) : codeValid === true ? ( 
+                         <CheckCircle2 className="w-5 h-5 text-green-500" /> 
+                       ) : codeValid === false ? ( 
+                         <AlertCircle className="w-5 h-5 text-red-500" /> 
+                       ) : null 
+                     } 
+                   /> 
+                 </div> 
+                 <Button 
+                   variant="outline" 
+                   onClick={handleGenerateActivationCode} 
+                   disabled={businessFormLoading} 
+                   className="mt-6 h-9" 
+                 > 
+                   Generate 
+                 </Button> 
+               </div> 
+               {codeValid === false && ( 
+                 <p className="mt-1 text-sm text-red-500">Invalid activation code</p> 
+               )} 
+               {codeValid === true && ( 
+                 <p className="mt-1 text-sm text-green-600">Valid activation code</p> 
+               )} 
+               <p className="mt-1 text-xs text-slate-500"> 
+                 Contact your Parcera sales representative for an activation code 
+               </p> 
+             </div> 
+ 
+             <Button 
+               onClick={handleValidateBusinessDetails} 
+               className="w-full" 
+               disabled={!businessForm.name || !businessForm.contactEmail || !businessForm.activationCode || codeValid === false} 
+             > 
+               Save & Continue 
+               <ArrowRight className="w-4 h-4 ml-2" /> 
+             </Button> 
+           </div> 
+         </CardBody> 
+       </Card> 
+     </div> 
+   ); 
+ 
+ case 'provider-select': 
+   return ( 
+     <div className="w-full max-w-lg mx-auto"> 
+       <div className="text-center mb-8"> 
+         <div className="inline-flex items-center justify-center w-16 h-16 rounded-2xl bg-gradient-to-br from-fuchsia-500 to-purple-600 mb-4"> 
+           <Sliders className="w-8 h-8 text-white" /> 
+         </div> 
+         <h2 className="text-2xl font-bold text-slate-900 mb-2">Choose Your IVR Provider</h2> 
+         <p className="text-slate-500">Select the voice AI engine that will power your phone assistant</p> 
+       </div> 
+       <div className="grid grid-cols-1 sm:grid-cols-2 gap-4"> 
+         {([ 
+           { 
+             id: 'elevenlabs' as IvrProvider, 
+             title: 'ElevenLabs AI', 
+             description: 'Fully managed, ultra-low latency voice AI. Best for quick setup with premium voice quality.', 
+             badge: 'Managed', 
+             features: ['Premium voice cloning', 'Ultra-low latency', 'Zero infrastructure'], 
+           }, 
+           { 
+             id: 'parcera_voice' as IvrProvider, 
+             title: 'Parcera Voice AI', 
+             description: 'Self-hosted on your infrastructure via LiveKit. Full control over the voice pipeline.', 
+             badge: 'Self-hosted', 
+             features: ['Full pipeline control', 'Custom integrations', 'Lower cost at scale'], 
+           }, 
+         ]).map((provider) => ( 
+           <div 
+             key={provider.id} 
+             onClick={() => setIvrProvider(provider.id)} 
+             className={clsx( 
+               'cursor-pointer rounded-xl border-2 p-5 transition-all hover:shadow-md', 
+               ivrProvider === provider.id 
+                 ? 'border-fuchsia-500 bg-fuchsia-50/50 shadow-sm' 
+                 : 'border-slate-200 hover:border-slate-300' 
+             )} 
+           > 
+             <div className="flex items-center justify-between mb-3"> 
+               <h3 className="font-semibold text-slate-900">{provider.title}</h3> 
+               <Badge variant="outline" className="text-[10px]">{provider.badge}</Badge> 
+             </div> 
+             <p className="text-sm text-slate-500 mb-3">{provider.description}</p> 
+             <ul className="space-y-1"> 
+               {provider.features.map((f) => ( 
+                 <li key={f} className="flex items-center text-xs text-slate-600"> 
+                   <CheckCircle2 className="w-3 h-3 mr-1.5 text-green-500 flex-shrink-0" /> 
+                   {f} 
+                 </li> 
+               ))} 
+             </ul> 
+             {ivrProvider === provider.id && ( 
+               <div className="mt-3 flex items-center text-xs font-medium text-fuchsia-600"> 
+                 <Check className="w-3 h-3 mr-1" /> Selected 
+               </div> 
+             )} 
+           </div> 
+         ))} 
+       </div> 
+     </div> 
+   ); 
+ 
+ case 'customize-voice': 
+   return ( 
+     <VoiceGreetingStep 
+       businessName={merchant?.businessName || pendingToastData?.businessName || 'your business'} 
+       agentName={agentName} 
+       onAgentNameChange={setAgentName} 
+       selectedVoiceId={selectedVoiceId} 
+       onVoiceSelect={setSelectedVoiceId} 
+       selectedLanguages={selectedLanguages} 
+       onLanguagesChange={setSelectedLanguages} 
+       greetingEn={greetingEn} 
+       greetingEs={greetingEs} 
+       onGreetingEnChange={setGreetingEn} 
+       onGreetingEsChange={setGreetingEs} 
+       fallbackPhone={fallbackPhone} 
+       onFallbackPhoneChange={setFallbackPhone} 
+     /> 
+   ); 
+ 
+ case 'phone-linking': 
+   return ( 
+     <PhoneLinkingStep 
+       phoneSetupMode={phoneSetupMode} 
+       onPhoneSetupModeChange={setPhoneSetupMode} 
+       onPhoneSelected={setSelectedPhone} 
+       selectedPhone={selectedPhone} 
+       locationId={locationId} 
+       phoneProvisioningError={phoneProvisioningError} 
+       provisionedPhoneNumber={provisionedPhoneNumber?.phoneNumber || null} 
+     /> 
+   ); 
+ 
+ case 'knowledge-base': 
+   return ( 
+     <KnowledgeBaseStep 
+       businessName={merchant?.businessName || pendingToastData?.businessName || 'Your Business'} 
+       address={merchant?.address || pendingToastData?.address || ''} 
+       phone={merchant?.phone || pendingToastData?.phone || ''} 
+       businessDomain={pendingToastData?.businessDomain || 'restaurant'} 
+       knowledge={businessKnowledge} 
+       onKnowledgeChange={setBusinessKnowledge} 
+     /> 
+   ); 
+ 
+ case 'launch': 
+   const launchBusinessName = merchant?.businessName || pendingToastData?.businessName || 'Your Business'; 
+ 
+   return ( 
+     <div className="w-full space-y-5"> 
+       <div className="text-center"> 
+         <h2 className="text-xl font-semibold text-slate-900 mb-1 flex items-center justify-center gap-2"> 
+           {agent ? ( 
+             <> 
+               <PartyPopper className="w-5 h-5 text-fuchsia-600" /> 
+               Your AI is Live! 
+             </> 
+           ) : ( 
+             <> 
+               <Rocket className="w-5 h-5 text-fuchsia-600" /> 
+               Ready to Launch 
+             </> 
+           )} 
+         </h2> 
+         <p className="text-sm text-slate-600"> 
+           {agent ? 'Your assistant is ready to handle calls' : 'Review your configuration and deploy'} 
+         </p> 
+       </div> 
+ 
+       <div className="grid grid-cols-1 md:grid-cols-3 gap-3"> 
+         <div className="rounded-lg border border-fuchsia-100 bg-fuchsia-50/50 p-4"> 
+           <div className="flex items-start gap-3"> 
+             <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-fuchsia-500 to-fuchsia-600 flex items-center justify-center flex-shrink-0"> 
+               <Store className="h-4 w-4 text-white" /> 
+             </div> 
+             <div className="min-w-0"> 
+               <h3 className="text-[10px] font-semibold text-fuchsia-600 uppercase tracking-wide">Business</h3> 
+               <p className="font-semibold text-sm text-slate-900 truncate">{launchBusinessName}</p> 
+               <p className="text-[11px] text-slate-600 flex items-center gap-1"> 
+                 <Check className="w-3 h-3 text-emerald-600" /> 
+                 Toast Tables 
+               </p> 
+             </div> 
+           </div> 
+         </div> 
+ 
+         <div className="rounded-lg border border-purple-100 bg-purple-50/50 p-4"> 
+           <div className="flex items-start gap-3"> 
+             <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-purple-500 to-purple-600 flex items-center justify-center flex-shrink-0"> 
+               <FileText className="h-4 w-4 text-white" /> 
+             </div> 
+             <div className="min-w-0"> 
+               <h3 className="text-[10px] font-semibold text-purple-600 uppercase tracking-wide">Flow</h3> 
+               <p className="font-semibold text-sm text-slate-900 truncate">Free Reservations</p> 
+               <p className="text-[11px] text-slate-600 flex items-center gap-1"> 
+                 <Check className="w-3 h-3 text-emerald-600" /> 
+                 Standard tools 
+               </p> 
+             </div> 
+           </div> 
+         </div> 
+ 
+         <div className="rounded-lg border border-violet-100 bg-violet-50/50 p-4"> 
+           <div className="flex items-start gap-3"> 
+             <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-violet-500 to-violet-600 flex items-center justify-center flex-shrink-0"> 
+               <Sliders className="h-4 w-4 text-white" /> 
+             </div> 
+             <div className="min-w-0"> 
+               <h3 className="text-[10px] font-semibold text-violet-600 uppercase tracking-wide">Assistant</h3> 
+               <p className="font-semibold text-sm text-slate-900 truncate"> 
+                 {ivrProvider === 'parcera_voice' ? 'Parcera Voice AI' : agentName} 
+               </p> 
+               <p className="text-[11px] text-slate-600 flex items-center gap-1"> 
+                 <Check className="w-3 h-3 text-emerald-600" /> 
+                 {ivrProvider === 'parcera_voice' ? 'LiveKit Pipeline' : (selectedLanguages.includes('es') ? 'EN + ES' : 'English')} 
+               </p> 
+             </div> 
+           </div> 
+         </div> 
+       </div> 
+ 
+       <div className="bg-slate-50 rounded-lg p-4 border border-slate-200"> 
+         <h3 className="text-sm font-semibold text-slate-900 mb-3 flex items-center gap-2"> 
+           <Mic className="w-4 h-4 text-fuchsia-600" /> 
+           Greeting Preview 
+         </h3> 
+         <div className="space-y-2"> 
+           <div className="bg-white rounded-lg p-3 border border-slate-200"> 
+             <div className="flex items-center gap-1.5 mb-1"> 
+               <Badge className="bg-blue-100 text-blue-700 border-0 text-[10px] px-1.5 py-0">EN</Badge> 
+               <span className="text-[10px] text-slate-500">English</span> 
+             </div> 
+             <p className="text-xs text-slate-700 italic">"{greetingEn}"</p> 
+           </div> 
+           {selectedLanguages.includes('es') && greetingEs && ( 
+             <div className="bg-white rounded-lg p-3 border border-slate-200"> 
+               <div className="flex items-center gap-1.5 mb-1"> 
+                 <Badge className="bg-orange-100 text-orange-700 border-0 text-[10px] px-1.5 py-0">ES</Badge> 
+                 <span className="text-[10px] text-slate-500">Español</span> 
+               </div> 
+               <p className="text-xs text-slate-700 italic">"{greetingEs}"</p> 
+             </div> 
+           )} 
+         </div> 
+       </div> 
+ 
+       {/* Phone Number Display (if provisioned) */} 
+       {provisionedPhoneNumber && ( 
+         <div className="bg-gradient-to-br from-fuchsia-50 to-purple-50/50 rounded-lg p-4 border-2 border-fuchsia-200 animate-in fade-in slide-in-from-top-2 duration-300"> 
+           <h3 className="text-sm font-semibold text-slate-900 mb-3 flex items-center gap-2"> 
+             <Phone className="w-4 h-4 text-fuchsia-600" /> 
+             Your Phone Number 
+           </h3> 
+           <div className="bg-white rounded-lg p-4 border border-fuchsia-200"> 
+             <div className="flex items-center justify-between"> 
+               <div className="flex-1"> 
+                 <p className="text-xs text-slate-600 mb-1">Customer Call Number</p> 
+                 <p className="text-2xl font-bold text-fuchsia-700 font-mono"> 
+                   {provisionedPhoneNumber.phoneNumber} 
+                 </p> 
+                 <p className="text-xs text-slate-500 mt-1"> 
+                   Customers can call this number to reach your AI assistant 
+                 </p> 
+               </div> 
+               <div className="flex-shrink-0 ml-3"> 
+                 <div className="w-12 h-12 rounded-full bg-fuchsia-100 flex items-center justify-center"> 
+                   <Phone className="w-6 h-6 text-fuchsia-600" /> 
+                 </div> 
+               </div> 
+             </div> 
+           </div> 
+         </div> 
+       )} 
+ 
+       <div className="relative overflow-hidden rounded-xl bg-gradient-to-br from-fuchsia-500 via-purple-500 to-violet-600 p-6"> 
+         <div className="relative text-center"> 
+           {isLaunching ? ( 
+             <div className="py-4"> 
+               <div className="relative inline-block mb-4"> 
+                 <Loader2 className="w-10 h-10 text-white animate-spin" /> 
+               </div> 
+               <h3 className="text-lg font-semibold text-white mb-1">{launchProgress}</h3> 
+               <p className="text-sm text-white/80 flex items-center justify-center gap-1.5"> 
+                 This may take a moment... 
+                 <Coffee className="w-4 h-4" /> 
+               </p> 
+             </div> 
+           ) : agent ? ( 
+             <div className="py-4"> 
+               <div className="relative inline-block mb-4"> 
+                 <div className="w-14 h-14 rounded-full bg-white flex items-center justify-center shadow-lg animate-bounce"> 
+                   <Check className="h-7 w-7 text-fuchsia-600" strokeWidth={3} /> 
+                 </div> 
+               </div> 
+               <h3 className="text-lg font-semibold text-white mb-1 flex items-center justify-center gap-2"> 
+                 Your Voice AI Assistant is Live! 
+                 <PartyPopper className="w-5 h-5" /> 
+               </h3> 
+               <p className="text-sm text-white/80 mb-4"> 
+                 ID: <span className="font-mono text-xs bg-white/20 px-2 py-0.5 rounded">{agent.agentIdExternal}</span> 
+               </p> 
+               <Button 
+                 onClick={() => navigate('/login')} 
+                 className="h-9 px-5 text-sm font-medium bg-white text-fuchsia-600 hover:bg-white/90" 
+               > 
+                 Go to Login 
+                 <ChevronRight className="w-4 h-4 ml-1.5" /> 
+               </Button> 
+             </div> 
+           ) : ( 
+             <div className="py-4"> 
+               <div className="relative inline-block mb-4"> 
+                 <div className="w-14 h-14 rounded-full bg-white flex items-center justify-center shadow-lg hover:scale-105 transition-transform duration-200"> 
+                   <Rocket className="h-6 w-6 text-fuchsia-600" /> 
+                 </div> 
+               </div> 
+               <h3 className="text-lg font-semibold text-white mb-2">Everything is Ready!</h3> 
+               <p className="text-sm text-white/80 mb-5 max-w-md mx-auto"> 
+                 Your AI will handle reservations for {launchBusinessName} 
+               </p> 
+               <Button 
+                 onClick={handleLaunch} 
+                 className="h-10 px-6 text-sm font-semibold bg-white text-fuchsia-600 hover:bg-white/90 shadow-lg hover:shadow-xl hover:scale-105 transition-all duration-200" 
+               > 
+                 <Rocket className="w-4 h-4 mr-2" /> 
+                 Launch Voice AI Assistant 
+                 <Sparkles className="w-4 h-4 ml-2" /> 
+               </Button> 
+             </div> 
+           )} 
+         </div> 
+       </div> 
+     </div> 
+   ); 
+} 
+ 
+
+}; 
+
+return (  
+
+{/* LEFT SIDEBAR */}  
+
+Merchant Setup 
+
+  <div className="px-5 py-4 border-b border-slate-100"> 
+     <div className="flex items-center justify-between mb-2"> 
+       <p className="text-[10px] font-medium text-slate-500 uppercase tracking-wide">Progress</p> 
+       <p className="text-sm font-semibold text-fuchsia-600">{Math.round(progressPercentage)}%</p> 
+     </div> 
+     <div className="w-full h-1.5 bg-slate-100 rounded-full overflow-hidden"> 
+       <div 
+         className="h-full bg-gradient-to-r from-fuchsia-500 to-purple-600 rounded-full transition-all duration-300" 
+         style={{ width: `${progressPercentage}%` }} 
+       /> 
+     </div> 
+     <p className="text-[11px] text-slate-500 mt-1.5"> 
+       Step {currentStepIndex + 1}/{STEPS.length} 
+     </p> 
+   </div> 
+ 
+   <div className="flex-1 px-4 py-4 overflow-y-auto"> 
+     <nav className="space-y-1"> 
+       {STEPS.map((step, index) => { 
+         const isCurrent = step.id === currentStep; 
+         const isCompleted = currentStepIndex > index; 
+ 
+         return ( 
+           <div key={step.id}> 
+             <div 
+               className={clsx( 
+                 'flex items-center gap-3 px-3 py-2.5 rounded-lg transition-all duration-200', 
+                 isCurrent && 'bg-fuchsia-50 border border-fuchsia-100', 
+                 !isCurrent && !isCompleted && 'hover:bg-slate-50', 
+                 isCompleted && 'opacity-70' 
+               )} 
+             > 
+               <div className="flex-shrink-0">{renderStepCircle(index)}</div> 
+ 
+               <div className="flex-1 min-w-0"> 
+                 <div className="flex items-center gap-1.5"> 
+                   <p 
+                     className={clsx( 
+                       'text-xs font-medium truncate transition-colors duration-200', 
+                       isCurrent ? 'text-fuchsia-900' : isCompleted ? 'text-fuchsia-700' : 'text-slate-600' 
+                     )} 
+                   > 
+                     {step.title} 
+                   </p> 
+                   {step.isSkippable && ( 
+                     <Badge variant="outline" className="text-[9px] px-1 py-0 h-4 text-slate-400 border-slate-200"> 
+                       Optional 
+                     </Badge> 
+                   )} 
+                 </div> 
+                 <p 
+                   className={clsx( 
+                     'text-[10px] truncate transition-colors duration-200', 
+                     isCurrent ? 'text-fuchsia-600' : 'text-slate-400' 
+                   )} 
+                 > 
+                   {step.description} 
+                 </p> 
+               </div> 
+             </div> 
+ 
+             {index < STEPS.length - 1 && ( 
+               <div 
+                 className={clsx( 
+                   'ml-[23px] h-4 w-0.5 rounded-full transition-colors duration-300', 
+                   currentStepIndex > index ? 'bg-gradient-to-b from-fuchsia-500 to-purple-500' : 'bg-slate-200' 
+                 )} 
+               /> 
+             )} 
+           </div> 
+         ); 
+       })} 
+     </nav> 
+   </div> 
+ 
+   <div className="px-4 py-3 border-t border-slate-100"> 
+     <Button 
+       variant="ghost" 
+       size="sm" 
+       onClick={() => navigate('/login')} 
+       className="w-full justify-start h-9 text-xs text-slate-600 hover:text-slate-900 hover:bg-slate-100" 
+     > 
+       <ArrowLeft className="w-3.5 h-3.5 mr-2" /> 
+       Back to Login 
+     </Button> 
+   </div> 
+ 
+   <div className="px-4 py-3 border-t border-slate-100"> 
+     <div className="flex items-center gap-2.5 px-3 py-2 bg-slate-50 rounded-lg"> 
+       <AlertCircle className="w-3.5 h-3.5 text-slate-400 flex-shrink-0" /> 
+       <div className="min-w-0"> 
+         <p className="text-[10px] text-slate-500"> 
+           Need help?{' '} 
+           <a href="mailto:support@parcera.ai" className="text-fuchsia-600 hover:underline font-medium"> 
+             Contact us 
+           </a> 
+         </p> 
+       </div> 
+     </div> 
+   </div> 
+ </aside> 
+ 
+ {/* MAIN CONTENT AREA */} 
+ <main className="flex-1 overflow-y-auto pb-20 relative"> 
+   <GradientBackground variant="default" /> 
+   <div className="max-w-4xl mx-auto px-8 py-6 relative z-10 min-h-[calc(100vh-200px)]">{renderStepContent()}</div> 
+ </main> 
+ 
+ {/* FOOTER NAVIGATION */} 
+ <div className="fixed bottom-0 left-64 right-0 bg-white border-t border-slate-200 shadow-lg z-50"> 
+   <div className="max-w-4xl mx-auto px-8 py-3"> 
+     <div className="flex justify-between items-center"> 
+       <Button 
+         variant="outline" 
+         size="sm" 
+         onClick={goToPrevStep} 
+         disabled={currentStepIndex === 0 || isLaunching} 
+         className="h-8 px-4 text-xs" 
+       > 
+         <ChevronLeft className="w-3.5 h-3.5 mr-1" /> 
+         Back 
+       </Button> 
+ 
+       <div className="flex items-center gap-2"> 
+         {STEPS.map((_, index) => ( 
+           <div 
+             key={index} 
+             className={clsx( 
+               'h-1.5 rounded-full transition-all duration-300', 
+               index === currentStepIndex 
+                 ? 'bg-gradient-to-r from-fuchsia-500 to-purple-600 w-4' 
+                 : index < currentStepIndex 
+                 ? 'bg-fuchsia-500 w-1.5' 
+                 : 'bg-slate-200 w-1.5' 
+             )} 
+           /> 
+         ))} 
+       </div> 
+ 
+       {currentStep === 'launch' ? ( 
+         <div className="w-[80px]" /> 
+       ) : currentStep === 'verify-phone' ? ( 
+         <div className="w-[80px]" /> 
+       ) : currentStep === 'toast-connect' ? ( 
+         <div className="flex items-center gap-2"> 
+           {!providerConfirmed ? ( 
+             <span className="text-xs text-slate-400">Select a reservation provider to continue</span> 
+           ) : !toastRestaurantInfo ? ( 
+             <span className="text-xs text-slate-400">Enter your restaurant GUID above</span> 
+           ) : ( 
+             <span className="text-xs text-slate-400">Click Continue in the card above</span> 
+           )} 
+         </div> 
+       ) : currentStep === 'business-details' ? ( 
+         <div className="w-[80px]" /> 
+       ) : ( 
+         <div className="flex items-center gap-2"> 
+           {STEPS.find((s) => s.id === currentStep)?.isSkippable && ( 
+             <Button 
+               variant="ghost" 
+               size="sm" 
+               onClick={goToNextStep} 
+               disabled={isLaunching} 
+               className="h-8 px-3 text-xs font-medium text-slate-500 hover:text-slate-700 hover:bg-slate-100" 
+             > 
+               <SkipForward className="w-3.5 h-3.5 mr-1" /> 
+               Skip for now 
+             </Button> 
+           )} 
+           <Button size="sm" onClick={goToNextStep} disabled={!canProceed() || isLaunching} className="h-8 px-4 text-xs"> 
+             Continue 
+             <ChevronRight className="w-3.5 h-3.5 ml-1" /> 
+           </Button> 
+         </div> 
+       )} 
+     </div> 
+   </div> 
+ </div> 
+</div> 
+ 
+
+); }; 
+
+export default OnboardingWizard; 
